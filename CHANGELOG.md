@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2
+
+### Added
+- Unit tests (`tests/`, stdlib `unittest`, no extra dependencies): Adobe Stock video requirements, ffprobe/frame extraction on generated clips, metadata rules (title/description/keywords, vertical video), OpenAI request handling (JSON mode, retries, fatal errors) with a fake client, description rewrite, Keychain storage, end-to-end batch processing. Run with `python -m unittest discover -s tests -t .`
+
 ## 1.1.1
 
 ### Fixed

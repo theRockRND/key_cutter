@@ -153,6 +153,15 @@ Metadata is written to image files via:
 
 Stock sites (Adobe Stock, Shutterstock, Getty Images, etc.) automatically read this metadata when uploading.
 
+## Tests
+
+```bash
+source venv/bin/activate
+python -m unittest discover -s tests -t .
+```
+
+Tests use only the standard library and a fake OpenAI client (no API key and no network needed). Tests that need ffmpeg are skipped if it is not installed.
+
 ## Requirements
 
 - Python 3.8+

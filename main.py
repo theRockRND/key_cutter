@@ -67,7 +67,7 @@ def save_api_key(api_key):
         print(f"Failed to save API key to keychain: {e}")
         return False
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # Local models removed - using only OpenAI API
 
