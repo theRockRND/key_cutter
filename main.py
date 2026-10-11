@@ -16,6 +16,7 @@ import base64
 import json
 import httpx
 import time
+import tempfile
 from datetime import datetime
 from PIL import Image
 import piexif
@@ -24,8 +25,98 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+try:
+    import keyring
+    KEYRING_AVAILABLE = True
+except ImportError:
+    KEYRING_AVAILABLE = False
+
+# Last used API key is stored in system keychain (macOS Keychain)
+KEYRING_SERVICE = 'TagStock PhotoKey'
+KEYRING_USER = 'openai_api_key'
+
+
+def load_saved_api_key():
+    """Returns API key saved in keychain or None"""
+    if not KEYRING_AVAILABLE:
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+    except Exception as e:
+        print(f"Failed to read API key from keychain: {e}")
+        return None
+
+
+def save_api_key(api_key):
+    """Saves API key to keychain. Returns True on success"""
+    if not KEYRING_AVAILABLE:
+        return False
+    try:
+        keyring.set_password(KEYRING_SERVICE, KEYRING_USER, api_key)
+        return True
+    except Exception as e:
+        print(f"Failed to save API key to keychain: {e}")
+        return False
+
+__version__ = "1.1.0"
 
 # Local models removed - using only OpenAI API
+
+from video_utils import (VIDEO_EXTENSIONS, is_video_file, probe_video, check_video_requirements,
+                         get_orientation, extract_frames)
+
+ANALYSIS_PROMPT = """Analyze this image carefully and describe what you see. Then provide metadata for stock photography.
+
+IMPORTANT: Look at the image and describe what is actually shown - the main subject, objects, animals, people, scenery, colors, actions, etc.
+
+Return ONLY a JSON object with this exact structure (no markdown, no code blocks):
+{
+  "title": "descriptive title based on what you see in the image, English only, no special characters",
+  "description": "one natural English sentence about the image, 40-80 characters, no special characters",
+  "keywords": "comma-separated list of 65 individual words describing the image content, English only, no special characters, only single words not phrases"
+}
+
+CRITICAL RULES:
+- Title: Describe the main subject/scene with 6 to 10 WORDS (e.g. "Deer Grazing On Green Grass In Field", "Sunset Over Mountains With Clouds"). Only English letters and spaces, no special characters.
+- Description: ONE natural, grammatical sentence (e.g. "Young animal pauses near a wooden fence on a quiet summer morning"). 40-80 characters, English only, no special characters. It must NOT reuse any word from the title and should avoid words from the keywords - use synonyms instead.
+- Keywords: List 65 individual REAL English words separated by commas (e.g. "deer, wildlife, nature, grass, animal, mammal, forest, outdoor, wild, grazing, brown, green, fence, trees, sky, sunny, natural, habitat"). Most relevant words first. Describe the main subject, objects, colors, textures, actions, environment, mood, season, time of day, weather, concepts. Only single words, no phrases, no invented words, no plural/singular duplicates of the same word, English only.
+
+Analyze the image NOW and return ONLY the JSON object."""
+
+# OpenAI model for image/video analysis
+OPENAI_MODEL = 'gpt-6-luna'
+
+VIDEO_CSV_NAME = 'adobe_stock_videos.csv'
+
+# Adobe Stock accepts up to 49 keywords
+MAX_KEYWORDS = 49
+MIN_KEYWORDS = 25  # below this a warning is logged
+
+# Stop words: never used in title or keywords
+STOP_WORDS = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "is", "are", "was", "were",
+    "and", "or", "but", "this", "that", "these", "those", "it", "its", "they", "them", "what", "you",
+    "by", "from", "as", "be", "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "must", "can", "up", "out", "so", "if", "no", "not", "only", "just",
+    "more", "most", "very", "much", "many", "some", "any", "all", "each", "every", "both", "such",
+    "than", "too", "also", "here", "there", "where", "when", "why", "how", "who", "which", "whose", "whom",
+    "see", "image", "photography", "photo", "picture", "detailed", "describe", "scene", "happening",
+    "showing", "view", "professional", "high", "quality"
+}
+
+# Generic words removed from description phrase (articles and prepositions are kept for grammar)
+DESCRIPTION_BANNED_WORDS = {
+    "see", "image", "photography", "photo", "picture", "detailed", "describe", "scene", "happening",
+    "showing", "view", "professional", "high", "quality", "list", "main", "objects", "colors", "elements"
+}
+
+# Words that may not end a truncated description
+DESCRIPTION_TRAILING_WORDS = STOP_WORDS | {"between", "under", "over", "near", "into", "through", "across",
+                                           "behind", "along", "around", "against", "beside", "below", "above"}
+
+VIDEO_PROMPT_INTRO = """The {count} images below are frames taken from the beginning, middle and end of ONE stock video clip. Treat them as a single video: describe the subject, action and motion over time, not separate photos.
+
+"""
 
 
 class ProcessingThread(QThread):
@@ -39,8 +130,8 @@ class ProcessingThread(QThread):
         self.input_folder = input_folder
         self.output_folder = output_folder
         self.generate_metadata = generate_metadata  # Enabled by default
-        # Automatic GPT API key (if no other key is provided)
-        self.api_key = api_key or "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"
+        # API key from UI field, otherwise OPENAI_API_KEY environment variable
+        self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         self.previous_titles = set()  # Track previous titles to avoid duplicates
         self.previous_descriptions = set()  # Track previous descriptions
         self._stop_requested = False  # Flag for stopping processing
@@ -59,23 +150,19 @@ class ProcessingThread(QThread):
         self.log_message.emit(f"[Processing] Generate metadata: {self.generate_metadata}")
         self.log_message.emit(f"[Processing] Using OpenAI API (GPT)")
         
-        # Find only JPEG files
+        # Find JPEG and video files (suffix check is case-insensitive, no duplicates on macOS)
         image_extensions = ['.jpg', '.jpeg']
-        image_files = []
         
-        self.log_message.emit(f"[Processing] Searching for JPEG files in folder: {self.input_folder}")
-        for ext in image_extensions:
-            found_lower = list(Path(self.input_folder).glob(f"*{ext}"))
-            found_upper = list(Path(self.input_folder).glob(f"*{ext.upper()}"))
-            image_files.extend(found_lower)
-            image_files.extend(found_upper)
-            self.log_message.emit(f"[Processing] Found files with extension {ext}: {len(found_lower)} (lowercase), {len(found_upper)} (uppercase)")
+        self.log_message.emit(f"[Processing] Searching for JPEG and video files in folder: {self.input_folder}")
+        all_files = sorted(p for p in Path(self.input_folder).iterdir() if p.is_file())
+        image_files = [p for p in all_files if p.suffix.lower() in image_extensions + VIDEO_EXTENSIONS]
+        video_count = sum(1 for p in image_files if is_video_file(p))
         
         total = len(image_files)
-        self.log_message.emit(f"[Processing] Total JPEG files found: {total}")
+        self.log_message.emit(f"[Processing] Files found: {total - video_count} JPEG, {video_count} video ({', '.join(VIDEO_EXTENSIONS)})")
         
         if total == 0:
-            self.log_message.emit("[Processing] ERROR: JPEG files not found!")
+            self.log_message.emit("[Processing] ERROR: JPEG or video files not found!")
             self.finished.emit([])
             return
         
@@ -85,6 +172,8 @@ class ProcessingThread(QThread):
         self.log_message.emit(f"[Processing] Output folder ready")
         
         processed_count = 0
+        rejected_videos = []  # (filename, [reasons]) - videos not meeting Adobe Stock requirements
+        self._video_csv_started = False  # Adobe Stock CSV is recreated on each run
         self.log_message.emit(f"[Processing] Starting processing of {total} files...")
         
         for idx, image_path in enumerate(image_files, 1):
@@ -99,11 +188,24 @@ class ProcessingThread(QThread):
                 self.log_message.emit(f"[Processing] Processing {idx}/{total}: {image_path.name}")
                 self.log_message.emit(f"[Processing] File size: {image_path.stat().st_size / 1024:.2f} KB")
                 
-                # Copy file to output folder
-                output_file_path = Path(self.output_folder) / image_path.name
-                self.log_message.emit(f"[Processing] Copying file to: {output_file_path}")
-                shutil.copy2(image_path, output_file_path)
-                self.log_message.emit(f"  ✓ File copied to output folder")
+                # Video: check Adobe Stock technical requirements before processing
+                video_info = None
+                if is_video_file(image_path):
+                    video_info, errors = self.check_video(image_path)
+                    if errors:
+                        rejected_videos.append((image_path.name, errors))
+                        self.progress.emit(idx, total)
+                        continue
+                
+                if video_info:
+                    # Video is not modified, so it is not copied: metadata goes to Adobe Stock CSV only
+                    output_file_path = image_path
+                else:
+                    # Copy file to output folder
+                    output_file_path = Path(self.output_folder) / image_path.name
+                    self.log_message.emit(f"[Processing] Copying file to: {output_file_path}")
+                    shutil.copy2(image_path, output_file_path)
+                    self.log_message.emit(f"  ✓ File copied to output folder")
                 
                 # Check for stop request before analysis
                 if self._stop_requested:
@@ -121,7 +223,7 @@ class ProcessingThread(QThread):
                     
                     self.log_message.emit(f"[Processing] Generating metadata for file {idx}/{total}...")
                     try:
-                        metadata = self.analyze_and_generate_metadata(output_file_path)
+                        metadata = self.analyze_and_generate_metadata(output_file_path, video_info)
                         self.log_message.emit(f"[Processing] Metadata successfully generated for file {idx}/{total}")
                     except Exception as e:
                         # If API error, stop processing
@@ -151,7 +253,10 @@ class ProcessingThread(QThread):
                     # Write metadata to copied file
                     try:
                         self.log_message.emit(f"[Processing] Writing metadata to file {idx}/{total}...")
-                        self.write_metadata_to_image(output_file_path, metadata)
+                        if video_info:
+                            self.write_video_csv_row(output_file_path.name, metadata)
+                        else:
+                            self.write_metadata_to_image(output_file_path, metadata)
                         self.log_message.emit(f"  ✓ Metadata written to file")
                     except Exception as e:
                         self.log_message.emit(f"  ⚠ [Processing] Error writing metadata: {str(e)}")
@@ -174,11 +279,45 @@ class ProcessingThread(QThread):
             self.log_message.emit("[Processing] Processing completed!")
             self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
             self.log_message.emit(f"[Processing] Results saved to: {self.output_folder}")
+            if self._video_csv_started:
+                self.log_message.emit(f"[Processing] Video metadata CSV for Adobe Stock: {Path(self.output_folder) / VIDEO_CSV_NAME}")
+            if rejected_videos:
+                self.log_message.emit(f"[Processing] ⚠ Videos skipped (do not meet Adobe Stock requirements): {len(rejected_videos)}")
+                for name, reasons in rejected_videos:
+                    self.log_message.emit(f"    ✗ {name}: {'; '.join(reasons)}")
             self.log_message.emit("=" * 80)
         else:
             self.log_message.emit("[Processing] Processing was stopped by user")
         
         self.finished.emit([])
+    
+    def check_video(self, video_path):
+        """Checks video against Adobe Stock technical requirements. Returns (video_info, errors)"""
+        self.log_message.emit(f"[Video] Checking Adobe Stock technical requirements...")
+        try:
+            info = probe_video(video_path)
+        except FileNotFoundError:
+            return None, ["ffprobe not found. Install: brew install ffmpeg"]
+        except Exception as e:
+            return None, [f"cannot read video: {str(e)}"]
+        
+        audio = info['audio']
+        audio_text = f"{audio['codec']} {audio['sample_rate']} Hz" if audio else "no audio"
+        fps_text = f"{info['fps']:.3f}" if info['fps'] else "?"
+        duration_text = f"{info['duration']:.2f}s" if info['duration'] is not None else "?"
+        self.log_message.emit(f"[Video] {info['width']}x{info['height']}, {fps_text} fps, {info['codec']}, "
+                              f"{duration_text}, {info['size_mb']:.1f} MB, {audio_text}")
+        
+        errors, warnings = check_video_requirements(info, video_path.suffix)
+        for warning in warnings:
+            self.log_message.emit(f"  ⚠ [Video] {warning}")
+        if errors:
+            for error in errors:
+                self.log_message.emit(f"  ✗ [Video] {error}")
+            self.log_message.emit(f"  ✗ [Video] Skipped: does not meet Adobe Stock requirements")
+        else:
+            self.log_message.emit(f"  ✓ [Video] Meets Adobe Stock technical requirements")
+        return info, errors
     
     def clean_text(self, text):
         """Cleans text from special characters, keeps only English letters, numbers and spaces"""
@@ -228,8 +367,8 @@ class ProcessingThread(QThread):
                     break
         return ', '.join(unique_words)
     
-    def analyze_image_with_ai(self, image_path):
-        """Analyzes image content through OpenAI GPT API"""
+    def analyze_image_with_ai(self, image_path, video_info=None):
+        """Analyzes image (or video frames) content through OpenAI GPT API"""
         self.log_message.emit(f"    [AI] Starting image analysis through OpenAI GPT API...")
         
         # API analysis
@@ -243,7 +382,16 @@ class ProcessingThread(QThread):
         
         # OpenAI API
         self.log_message.emit(f"    [AI] Using OpenAI GPT API")
-        result = self._analyze_with_openai_api(image_path, api_key)
+        if video_info is not None:
+            # Video: analyze several frames extracted from the clip
+            with tempfile.TemporaryDirectory() as frames_dir:
+                frames = extract_frames(image_path, frames_dir, video_info['duration'])
+                self.log_message.emit(f"    [AI] Extracted {len(frames)} frames from video")
+                if not frames:
+                    raise Exception("ERROR: Failed to extract frames from video (check ffmpeg)")
+                result = self._analyze_with_openai_api(frames, api_key, is_video=True)
+        else:
+            result = self._analyze_with_openai_api([image_path], api_key)
         # If OpenAI API failed (error, quota, etc.), stop processing
         if result is None:
             error_msg = "ERROR: OpenAI API is not working (check quota and API key). Processing stopped."
@@ -252,7 +400,23 @@ class ProcessingThread(QThread):
         self.log_message.emit(f"    [AI] OpenAI GPT API returned result: title={result.get('title', '')[:30] if result else 'None'}...")
         return result
     
-    def _analyze_with_openai_api(self, image_path, api_key):
+    def _build_messages(self, images_data, is_video=False):
+        """Builds OpenAI request messages for one image or several video frames"""
+        prompt = ANALYSIS_PROMPT
+        if is_video:
+            prompt = VIDEO_PROMPT_INTRO.format(count=len(images_data)) + prompt.replace(
+                "stock photography", "stock video footage")
+        content = [{"type": "text", "text": prompt}]
+        for image_data in images_data:
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_data}"
+                }
+            })
+        return [{"role": "user", "content": content}]
+    
+    def _analyze_with_openai_api(self, image_paths, api_key, is_video=False):
         """Analysis through OpenAI API"""
         self.log_message.emit(f"    [OpenAI] Starting analysis through OpenAI API...")
         
@@ -263,55 +427,26 @@ class ProcessingThread(QThread):
         
         try:
             self.log_message.emit(f"    [OpenAI] Opening and encoding image...")
-            # Open and encode image
-            with open(image_path, 'rb') as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+            # Open and encode images (one photo or several video frames)
+            images_data = []
+            for image_path in image_paths:
+                with open(image_path, 'rb') as image_file:
+                    images_data.append(base64.b64encode(image_file.read()).decode('utf-8'))
             
-            self.log_message.emit(f"    [OpenAI] Image encoded, size: {len(image_data)} characters")
+            self.log_message.emit(f"    [OpenAI] Encoded {len(images_data)} image(s), size: {sum(len(d) for d in images_data)} characters")
             
             # Use standard OpenAI endpoint
             self.log_message.emit(f"    [OpenAI] Using standard OpenAI endpoint")
             client = OpenAI(api_key=api_key)
             
-            self.log_message.emit(f"    [OpenAI] Sending request to API (model: gpt-5.1)...")
+            self.log_message.emit(f"    [OpenAI] Sending request to API (model: {OPENAI_MODEL})...")
             
             # Request to API for image analysis
             response = client.chat.completions.create(
-                model="gpt-5.1",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": """Analyze this image carefully and describe what you see. Then provide metadata for stock photography.
-
-IMPORTANT: Look at the image and describe what is actually shown - the main subject, objects, animals, people, scenery, colors, actions, etc.
-
-Return ONLY a JSON object with this exact structure (no markdown, no code blocks):
-{
-  "title": "descriptive title based on what you see in the image, English only, no special characters",
-  "description": "detailed description of what is in the image, English only, no special characters, maximum 80 characters, describe the scene/subject but do NOT include keywords",
-  "keywords": "comma-separated list of EXACTLY 50 individual words describing the image content, English only, no special characters, only single words not phrases. YOU MUST PROVIDE EXACTLY 50 WORDS - describe the main subject, objects, colors, textures, actions, environment, background, foreground, details, mood, season, time of day, weather, and any other relevant aspects. NO MORE, NO LESS."
-}
-
-CRITICAL RULES:
-- Title: Describe the main subject/scene with MORE THAN 5 WORDS (e.g. "Deer Grazing On Green Grass In Field", "Sunset Over Mountains With Clouds"). Only English letters and spaces, no special characters. YOU MUST PROVIDE MORE THAN 5 WORDS.
-- Description: Describe what you see in detail but without using keyword words with MORE THAN 5 WORDS (e.g. "Wildlife photography showing animal in natural habitat with fence and trees in background"). Maximum 80 characters, English only, no special characters. YOU MUST PROVIDE MORE THAN 5 WORDS.
-- Keywords: List EXACTLY 50 individual words separated by commas (e.g. "deer, wildlife, nature, grass, animal, mammal, forest, outdoor, wild, grazing, brown, green, fence, trees, sky, sunny, natural, habitat"). YOU MUST PROVIDE EXACTLY 50 WORDS - describe the main subject, objects, colors, textures, actions, environment, background, foreground, details, mood, season, time of day, weather, and any other relevant aspects. Only single words, no phrases, English only, no special characters. This is CRITICAL - you must provide exactly 50 words.
-
-Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."""
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_completion_tokens=1500,  # Increased to guarantee complete JSON with 50 keywords (enough for 100+ photos)
+                model=OPENAI_MODEL,
+                reasoning_effort="none",  # temperature is rejected when reasoning is on
+                messages=self._build_messages(images_data, is_video),
+                max_completion_tokens=1500,  # Enough for complete JSON with 65 keywords
                 temperature=0.3
             )
             
@@ -333,40 +468,9 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
                 try:
                     self.log_message.emit(f"    [OpenAI] Retrying after rate limit...")
                     response = client.chat.completions.create(
-                        model="gpt-5.1",
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": """Analyze this image carefully and describe what you see. Then provide metadata for stock photography.
-
-IMPORTANT: Look at the image and describe what is actually shown - the main subject, objects, animals, people, scenery, colors, actions, etc.
-
-Return ONLY a JSON object with this exact structure (no markdown, no code blocks):
-{
-  "title": "descriptive title based on what you see in the image, English only, no special characters",
-  "description": "detailed description of what is in the image, English only, no special characters, maximum 80 characters, describe the scene/subject but do NOT include keywords",
-  "keywords": "comma-separated list of EXACTLY 50 individual words describing the image content, English only, no special characters, only single words not phrases. YOU MUST PROVIDE EXACTLY 50 WORDS - describe the main subject, objects, colors, textures, actions, environment, background, foreground, details, mood, season, time of day, weather, and any other relevant aspects. NO MORE, NO LESS."
-}
-
-CRITICAL RULES:
-- Title: Describe the main subject/scene with MORE THAN 5 WORDS (e.g. "Deer Grazing On Green Grass In Field", "Sunset Over Mountains With Clouds"). Only English letters and spaces, no special characters. YOU MUST PROVIDE MORE THAN 5 WORDS.
-- Description: Describe what you see in detail but without using keyword words with MORE THAN 5 WORDS (e.g. "Wildlife photography showing animal in natural habitat with fence and trees in background"). Maximum 80 characters, English only, no special characters. YOU MUST PROVIDE MORE THAN 5 WORDS.
-- Keywords: List EXACTLY 50 individual words separated by commas (e.g. "deer, wildlife, nature, grass, animal, mammal, forest, outdoor, wild, grazing, brown, green, fence, trees, sky, sunny, natural, habitat"). YOU MUST PROVIDE EXACTLY 50 WORDS - describe the main subject, objects, colors, textures, actions, environment, background, foreground, details, mood, season, time of day, weather, and any other relevant aspects. Only single words, no phrases, English only, no special characters. This is CRITICAL - you must provide exactly 50 words.
-
-Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."""
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{image_data}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
+                        model=OPENAI_MODEL,
+                        reasoning_effort="none",
+                        messages=self._build_messages(images_data, is_video),
                         max_completion_tokens=1500,
                         temperature=0.3
                     )
@@ -379,6 +483,31 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
             self.log_message.emit(f"    ❌ Error analyzing through OpenAI API: {error_str}")
             import traceback
             self.log_message.emit(f"    [OpenAI] Error details: {traceback.format_exc()}")
+            return None
+    
+    def _rewrite_description(self, description, forbidden_words):
+        """Text-only request: rewrites description without forbidden words. Returns None on failure"""
+        if not OPENAI_AVAILABLE or not self.api_key:
+            return None
+        prompt = (f"Rewrite this stock footage description as ONE natural, grammatical English sentence, "
+                  f"40-80 characters, no special characters. Keep the meaning. "
+                  f"Do NOT use any of these words or their forms: {', '.join(forbidden_words)}.\n\n"
+                  f"Sentence: {description}\n\nReturn ONLY the new sentence.")
+        try:
+            client = OpenAI(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                reasoning_effort="none",
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=100,
+                temperature=0.3
+            )
+            rewritten = self.clean_text(response.choices[0].message.content or '')
+            if set(self.normalize_words(rewritten)) & set(forbidden_words):
+                self.log_message.emit(f"    [Metadata] Rewritten description still uses forbidden words, they will be removed")
+            return rewritten or None
+        except Exception as e:
+            self.log_message.emit(f"    ⚠ [Metadata] Description rewrite failed: {str(e)}")
             return None
     
     def _parse_ai_response(self, content):
@@ -544,473 +673,145 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
             # If space too close to start, truncate hard
             return truncated
     
+    def build_description(self, description_raw, title_words_set):
+        """Keeps AI sentence, removes title words and generic words. Returns None if result is unusable"""
+        words = [w for w in description_raw.split()
+                 if w.lower() not in title_words_set and w.lower() not in DESCRIPTION_BANNED_WORDS]
+        description = self.truncate_description(' '.join(words), max_length=80)
+        words = description.split()
+        # Do not end with a dangling article/preposition
+        while words and words[-1].lower() in DESCRIPTION_TRAILING_WORDS:
+            words.pop()
+        # Do not start with a dangling article/preposition left after removing title words
+        while words and words[0].lower() in DESCRIPTION_TRAILING_WORDS - {"a", "an", "the"}:
+            words.pop(0)
+        if len(words) < 6:
+            return None
+        description = ' '.join(words)
+        description = description[0].upper() + description[1:]
+        if len(description) < 15:
+            return None
+        return description
+    
     def have_common_words(self, text1, text2):
         """Checks for common words between two texts"""
         words1 = set(self.normalize_words(text1))
         words2 = set(self.normalize_words(text2))
         return bool(words1 & words2)
     
-    def analyze_and_generate_metadata(self, image_path):
-        """Analyzes image file and generates metadata based on content analysis"""
-        self.log_message.emit(f"    [Metadata] Starting metadata generation for image...")
+    def analyze_and_generate_metadata(self, image_path, video_info=None):
+        """Analyzes image (or video) file and generates metadata based on content analysis"""
+        self.log_message.emit(f"    [Metadata] Starting metadata generation for {'video' if video_info else 'image'}...")
+        
+        # Adobe Stock: vertical clips must have "vertical" and "video" in title and keywords
+        required_words = []
+        if video_info and get_orientation(video_info['width'], video_info['height']) == 'vertical':
+            required_words = ['vertical', 'video']
+        category = 'Video' if video_info else 'Photography'
         
         # Пытаемся проаналfromировать через AI
-        ai_metadata = self.analyze_image_with_ai(image_path)
+        ai_metadata = self.analyze_image_with_ai(image_path, video_info)
         
         if ai_metadata:
             self.log_message.emit(f"    [Metadata] AI metadata received, starting processing...")
-            # STEP 1: Collect ALL words from AI analysis
             title_raw = self.clean_text(ai_metadata.get('title', ''))
             description_raw = self.clean_text(ai_metadata.get('description', ''))
             keywords_str_raw = ai_metadata.get('keywords', '')
             
             self.log_message.emit(f"    [Metadata] Received from AI: title='{title_raw[:30]}...', description='{description_raw[:30]}...', keywords_count={len(keywords_str_raw.split(',')) if keywords_str_raw else 0}")
             
-            # Extract all words from all sources
+            # All content words from AI analysis (reserve source for title/keywords)
             all_text = f"{title_raw} {description_raw} {keywords_str_raw}".lower()
-            all_words = self.normalize_words(all_text)
+            all_words_filtered = list(dict.fromkeys(
+                w for w in self.normalize_words(all_text) if len(w) >= 3 and w not in STOP_WORDS))
             
-            # Stop words for filtering
-            stop_words = {
-                "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "is", "are", "was", "were",
-                "and", "or", "but", "this", "that", "these", "those", "it", "its", "they", "them", "what", "you",
-                "by", "from", "as", "be", "have", "has", "had", "do", "does", "did", "will", "would", "could",
-                "should", "may", "might", "must", "can", "up", "out", "so", "if", "no", "not", "only", "just",
-                "more", "most", "very", "much", "many", "some", "any", "all", "each", "every", "both", "such",
-                "than", "too", "also", "here", "there", "where", "when", "why", "how", "who", "which", "whose", "whom",
-                "see", "image", "photography", "photo", "picture", "detailed", "describe", "scene", "happening",
-                "showing", "view", "professional", "high", "quality"
-            }
-            
-            # Filter: only words with length >= 3 characters and not stop words
-            all_words_filtered = [w for w in all_words if len(w) >= 3 and w not in stop_words]
-            all_words_set = set(all_words_filtered)
-            
-            self.log_message.emit(f"    [Metadata] Extracted {len(all_words_filtered)} unique words from AI analysis")
-            
-            # STEP 2: Generate TITLE (without stop words, maximum 10 words, more than 5 words)
-            title_words_raw = self.normalize_words(title_raw)
-            title_words_candidates = [w for w in title_words_raw if len(w) >= 3 and w not in stop_words]
-            
-            self.log_message.emit(f"    [Metadata] STEP 2: Generate TITLE from {len(title_words_candidates)} words")
-            
-            # If title from AI is too short (< 5 words), supplement from all_words
-            if len(title_words_candidates) <= 5:
-                title_words_candidates = list(dict.fromkeys(title_words_candidates))  # Remove duplicates
+            # STEP 1: TITLE (6-10 unique words, no stop words)
+            title_words = list(dict.fromkeys(
+                w for w in self.normalize_words(title_raw) if len(w) >= 3 and w not in STOP_WORDS))
+            if len(title_words) <= 5:
                 for word in all_words_filtered:
-                    if len(title_words_candidates) >= 6:  # More than 5 words
+                    if len(title_words) >= 6:
                         break
-                    if word not in title_words_candidates:
-                        title_words_candidates.append(word)
+                    if word not in title_words:
+                        title_words.append(word)
+            if required_words:
+                title_words = [w for w in title_words if w not in required_words]
+                title_words = title_words[:10 - len(required_words)] + required_words
+            title_words = title_words[:10]
+            title = ' '.join(w.title() for w in title_words)
+            title_words_set = set(title_words)
+            if len(title_words) <= 5:
+                self.log_message.emit(f"    ⚠ WARNING: Title contains only {len(title_words)} words (requires more than 5)")
+            self.log_message.emit(f"    [Metadata] TITLE: '{title}' ({len(title_words)} words)")
             
-            # Limit to 10 words and format Title Case
-            title_words_final = title_words_candidates[:10]
-            title = ' '.join([w.title() for w in title_words_final])
-            
-            # If title still <= 5 words, this is a problem, but continue
-            if len(title_words_final) <= 5:
-                self.log_message.emit(f"    ⚠ WARNING: Title contains only {len(title_words_final)} words (requires more than 5)")
-            
-            title_words_set = set([w.lower() for w in title_words_final])
-            
-            self.log_message.emit(f"    [Metadata] TITLE generated: '{title}' ({len(title_words_final)} words)")
-            
-            # STEP 3: Generate KEYWORDS (without words from title, up to 50 words)
-            keywords_list = []
-            keywords_seen = set()
-            
-            self.log_message.emit(f"    [Metadata] STEP 3: Generate KEYWORDS...")
-            
-            # First use keywords from AI (if available)
-            if keywords_str_raw:
-                keywords_raw_list = [self.clean_text(kw.strip()).lower() for kw in keywords_str_raw.split(',') if kw.strip()]
-                for kw in keywords_raw_list:
-                    kw_clean = self.normalize_words(kw)
-                    if kw_clean and len(kw_clean[0]) >= 3:
-                        kw_word = kw_clean[0]
-                        if (kw_word not in stop_words and 
-                            kw_word not in title_words_set and
-                            kw_word not in keywords_seen):
-                            keywords_list.append(kw_word)
-                            keywords_seen.add(kw_word)
-                            if len(keywords_list) >= 50:
-                                break
-            
-            self.log_message.emit(f"    [Metadata] From AI keywords received {len(keywords_list)} words")
-            
-            # Supplement keywords from all_words (but NOT from title)
-            if len(keywords_list) < 50:
-                for word in all_words_filtered:
-                    if len(keywords_list) >= 50:
-                        break
-                    if (word not in title_words_set and
-                        word not in keywords_seen):
-                        keywords_list.append(word)
-                        keywords_seen.add(word)
-            
-            self.log_message.emit(f"    [Metadata] After supplementing from all_words: {len(keywords_list)} keywords")
-            
-            # If still insufficient, generate word variations
-            if len(keywords_list) < 50:
-                existing_keywords_copy = keywords_list.copy()
-                for kw in existing_keywords_copy:
-                    if len(keywords_list) >= 50:
-                        break
-                    
-                    # Plural
-                    if not kw.endswith('s') and len(kw) >= 3:
-                        plural = kw + 's'
-                        if (plural not in title_words_set and
-                            plural not in keywords_seen and
-                            plural not in stop_words):
-                            keywords_list.append(plural)
-                            keywords_seen.add(plural)
-                    
-                    # Singular
-                    if kw.endswith('s') and len(kw) > 3:
-                        singular = kw[:-1]
-                        if (singular not in title_words_set and
-                            singular not in keywords_seen and
-                            len(singular) >= 3 and
-                            singular not in stop_words):
-                            keywords_list.append(singular)
-                            keywords_seen.add(singular)
-                    
-                    # Remove endings -ing, -ed, -er, -est, -ly
-                    for ending, length in [('ing', 3), ('ed', 2), ('er', 2), ('est', 3), ('ly', 2)]:
-                        if kw.endswith(ending) and len(kw) > (3 + length):
-                            base = kw[:-length]
-                            if (base not in title_words_set and
-                                base not in keywords_seen and
-                                len(base) >= 3 and
-                                base not in stop_words):
-                                keywords_list.append(base)
-                                keywords_seen.add(base)
-                                if len(keywords_list) >= 50:
-                                    break
-                    
-                    if len(keywords_list) >= 50:
-                        break
-            
-            self.log_message.emit(f"    [Metadata] After generating variations: {len(keywords_list)} keywords")
-            
-            # STEP 4: Generate DESCRIPTION (without words from title и keywords, more than 5 words, 15-80 characters)
-            # IMPORTANT: description must NOT contain words from title and keywords (0 common words)
-            keyword_set_for_desc = set([kw.lower() for kw in keywords_list])
-            
-            self.log_message.emit(f"    [Metadata] STEP 4: Generate DESCRIPTION...")
-            
-            description_words_candidates = []
-            
-            # Strategy 1: Use words from original description from AI, which are NOT in title and NOT in keywords
-            if description_raw:
-                desc_words_raw = self.normalize_words(description_raw)
-                desc_words_filtered = [w for w in desc_words_raw if len(w) >= 3 and w not in stop_words]
-                # Take only words, which are not in title and keywords
-                for word in desc_words_filtered:
-                    if (word not in title_words_set and 
-                        word not in keyword_set_for_desc and
-                        word not in description_words_candidates):
-                        description_words_candidates.append(word)
-                        if len(description_words_candidates) >= 15:  # Enough words
-                            break
-            
-            self.log_message.emit(f"    [Metadata] From original description received {len(description_words_candidates)} words")
-            
-            # Strategy 2: Supplement from all_words with words, which are not in title and keywords
-            if len(description_words_candidates) < 6:
-                desc_words_seen = set([w.lower() for w in description_words_candidates])
-                # Take words from all_words, which are NOT in title, NOT in keywords and NOT already in description
-                allowed_words = [w for w in all_words_filtered 
-                               if w not in title_words_set and 
-                               w not in keyword_set_for_desc and
-                               w not in desc_words_seen]
-                
-                for word in allowed_words:
-                    if len(description_words_candidates) >= 15:  # Enough words
-                        break
-                    description_words_candidates.append(word)
-                    desc_words_seen.add(word)
-            
-            self.log_message.emit(f"    [Metadata] After supplementing from all_words: {len(description_words_candidates)} words для description")
-            
-            # Strategy 3: If still insufficient, используем wordsа from оригинального AI аналfromа (captions)
-            # но fromбегаем words from title и keywords
-            if len(description_words_candidates) < 6:
-                # Пробуем получить больше words from all_words (maybe they are in original AI response)
-                # But do not use words from title and keywords
-                desc_words_seen = set([w.lower() for w in description_words_candidates])
-                
-                # Go through all_words_filtered again, but more aggressively
-                for word in all_words_filtered:
-                    if len(description_words_candidates) >= 15:
-                        break
-                    if (word not in title_words_set and
-                        word not in keyword_set_for_desc and
-                        word not in desc_words_seen):
-                        description_words_candidates.append(word)
-                        desc_words_seen.add(word)
-            
-            self.log_message.emit(f"    [Metadata] After aggressive supplementing: {len(description_words_candidates)} words для description")
-            
-            # Form description
-            description = None
-            
-            if description_words_candidates and len(description_words_candidates) >= 6:
-                # Берем максимум 12 words для более лаконичного description
-                description = ' '.join(description_words_candidates[:12]).capitalize()
-                # Limit to 80 characters, truncating at word boundarysа
-                description = self.truncate_description(description, max_length=80)
-                self.log_message.emit(f"    ✓ Description сформирован from уникальных words: {description} ({len(self.normalize_words(description))} words)")
-            
-            # Если не удалось сформировать from уникальных words, try more aggressively
-            if not description or len(self.normalize_words(description)) < 6:
-                self.log_message.emit(f"    ⚠ WARNING: Не удалось сформировать description from уникальных words, пытаемся использовать дополнительные стратегии")
-                
-                # Strategy 4: Use words from all_words, which are NOT in title (but may be in keywords)
-                # This is better than intersection with title
-                desc_words_seen = set()
-                description_words_candidates = []
-                
-                for word in all_words_filtered:
-                    if len(description_words_candidates) >= 15:
-                        break
-                    # EXCLUDE only words from title (this is critical!)
-                    if word not in title_words_set and word not in desc_words_seen:
-                        description_words_candidates.append(word)
-                        desc_words_seen.add(word)
-                
-                if len(description_words_candidates) >= 6:
-                    # Берем максимум 12 words для более лаконичного description
-                    description = ' '.join(description_words_candidates[:12]).capitalize()
-                    # Limit to 80 characters, truncating at word boundarysа
-                    description = self.truncate_description(description, max_length=80)
-                    self.log_message.emit(f"    ⚠ WARNING: Description сформирован from all_words (fromбегая title): {description} ({len(self.normalize_words(description))} words)")
-                else:
-                    # Strategy 5: If still insufficient, use words from keywords_str_raw, which are not in title
-                    if keywords_str_raw:
-                        keywords_raw_list = [kw.strip() for kw in keywords_str_raw.replace(',', ',').split(',') if kw.strip()]
-                        keywords_raw_normalized = []
-                        for kw in keywords_raw_list:
-                            words = self.normalize_words(kw)
-                            keywords_raw_normalized.extend([w for w in words if len(w) >= 3 and w not in stop_words])
-                        
-                        desc_words_seen = set()
-                        description_words_candidates = []
-                        
-                        for word in keywords_raw_normalized:
-                            if len(description_words_candidates) >= 15:
-                                break
-                            # EXCLUDE only words from title
-                            if word not in title_words_set and word not in desc_words_seen:
-                                description_words_candidates.append(word)
-                                desc_words_seen.add(word)
-                        
-                        if len(description_words_candidates) >= 6:
-                            # Берем максимум 12 words для более лаконичного description
-                            description = ' '.join(description_words_candidates[:12]).capitalize()
-                            # Limit to 80 characters, truncating at word boundarysа
-                            description = self.truncate_description(description, max_length=80)
-                            self.log_message.emit(f"    ⚠ WARNING: Description сформирован from keywords_raw (fromбегая title): {description} ({len(self.normalize_words(description))} words)")
-                
-                # If still failed - critical error
-                if not description or len(self.normalize_words(description)) < 6:
-                    error_msg = f"❌ CRITICAL ERROR: Не удалось сформировать description from аналfromа fromображения (нет достаточного количества уникальных words, which are not in title)"
-                    self.log_message.emit(f"    {error_msg}")
-                    self.log_message.emit(f"    [Metadata] Debug information: title_words={len(title_words_set)}, all_words={len(all_words_filtered)}, keywords_count={len(keywords_list)}")
-                    raise Exception(error_msg)
-            
-            # CRITICAL CHECK: Убеждаемся, что description НЕ содержит words from title
-            desc_words_final = set(self.normalize_words(description))
-            common_with_title = desc_words_final & title_words_set
-            
-            if common_with_title:
-                self.log_message.emit(f"    ❌ CRITICAL ERROR: Description contains wordsа from title: {common_with_title}")
-                # Regeneration attempt: remove общие wordsа from description и дополняем уникальными
-                desc_words_unique = [w for w in desc_words_final if w not in title_words_set]
-                
-                # Дополняем до 6+ words уникальными wordsами
-                for word in all_words_filtered:
-                    if len(desc_words_unique) >= 15:
-                        break
-                    if word not in title_words_set and word not in desc_words_unique:
-                        desc_words_unique.append(word)
-                
-                if len(desc_words_unique) >= 6:
-                    # Берем максимум 12 words для более лаконичного description
-                    description = ' '.join(list(desc_words_unique)[:12]).capitalize()
-                    # Limit to 80 characters, truncating at word boundarysа
-                    description = self.truncate_description(description, max_length=80)
-                    self.log_message.emit(f"    ✓ Description перегенерирован without words from title: {description} ({len(self.normalize_words(description))} words)")
-                else:
-                    error_msg = f"❌ CRITICAL ERROR: Не удалось перегенерировать description without words from title (only available {len(desc_words_unique)} уникальных words)"
-                    self.log_message.emit(f"    {error_msg}")
-                    raise Exception(error_msg)
-            
-            # Проверяем, что description содержит more than 5 words
-            desc_words_check = self.normalize_words(description)
-            if len(desc_words_check) <= 5:
-                error_msg = f"❌ CRITICAL ERROR: Description contains only {len(desc_words_check)} words (requires more than 5)"
-                self.log_message.emit(f"    {error_msg}")
-                raise Exception(error_msg)
-            
-            # STEP 5: Final filtering of KEYWORDS from DESCRIPTION
+            # STEP 2: DESCRIPTION - AI sentence without title words and generic words
+            forbidden = sorted(set(w.lower() for w in description_raw.split())
+                               & (title_words_set | DESCRIPTION_BANNED_WORDS))
+            if forbidden:
+                # Ask the model to rewrite the sentence instead of cutting words out of it
+                self.log_message.emit(f"    [Metadata] Description uses title/generic words {forbidden}, asking AI to rewrite...")
+                rewritten = self._rewrite_description(description_raw, sorted(title_words_set | set(forbidden)))
+                if rewritten:
+                    self.log_message.emit(f"    [Metadata] Rewritten description: '{rewritten}'")
+                    description_raw = rewritten
+            description = self.build_description(description_raw, title_words_set)
+            if description is None:
+                # Fallback: word list from AI analysis, without title words
+                self.log_message.emit(f"    ⚠ WARNING: AI description unusable after removing title words, building from analysis words")
+                fallback_words = [w for w in all_words_filtered if w not in title_words_set][:12]
+                description = self.truncate_description(' '.join(fallback_words).capitalize(), max_length=80)
             desc_words_set = set(self.normalize_words(description))
-            keywords_filtered = [kw for kw in keywords_list if kw.lower() not in desc_words_set]
+            self.log_message.emit(f"    [Metadata] DESCRIPTION: '{description}' ({len(description)} characters)")
             
-            self.log_message.emit(f"    [Metadata] STEP 5: Filtering keywords from description: was {len(keywords_list)}, became {len(keywords_filtered)}")
+            # STEP 3: KEYWORDS - real words from AI only: not in title, not in description,
+            # no singular/plural duplicates, up to MAX_KEYWORDS
+            keywords_list = list(required_words)
+            keywords_seen = set(keywords_list)
             
-            # STEP 6: Fill KEYWORDS to 50 (aggressively)
-            keywords_filtered_set = set([kw.lower() for kw in keywords_filtered])
+            def add_keyword(word):
+                if (len(word) < 3 or word in STOP_WORDS or word in keywords_seen or
+                        word in title_words_set or word in desc_words_set):
+                    return
+                # Skip singular/plural duplicate of an existing keyword
+                if (word + 's' in keywords_seen or word + 'es' in keywords_seen or
+                        (word.endswith('s') and word[:-1] in keywords_seen) or
+                        (word.endswith('es') and word[:-2] in keywords_seen)):
+                    return
+                keywords_list.append(word)
+                keywords_seen.add(word)
             
-            self.log_message.emit(f"    [Metadata] STEP 6: Добивка keywords до 50...")
+            for kw in keywords_str_raw.split(','):
+                words = self.normalize_words(kw)
+                if len(words) == 1:
+                    add_keyword(words[0])
+            from_ai = len(keywords_list)
+            # Supplement from other AI words (title/description words are excluded by rules)
+            for word in all_words_filtered:
+                add_keyword(word)
+            keywords_list = keywords_list[:MAX_KEYWORDS]
             
-            # Strategy 1: Add words from all_words, which are not in title, description и keywords
-            if len(keywords_filtered) < 50:
-                for word in all_words_filtered:
-                    if len(keywords_filtered) >= 50:
-                        break
-                    if (word not in title_words_set and
-                        word not in desc_words_set and
-                        word not in keywords_filtered_set):
-                        keywords_filtered.append(word)
-                        keywords_filtered_set.add(word)
+            self.log_message.emit(f"    [Metadata] KEYWORDS: {len(keywords_list)} (from AI keywords: {from_ai})")
+            if len(keywords_list) < MIN_KEYWORDS:
+                self.log_message.emit(f"    ⚠ WARNING: Only {len(keywords_list)} keywords (recommended {MIN_KEYWORDS}-{MAX_KEYWORDS})")
+            keywords = ', '.join(keywords_list)
             
-            self.log_message.emit(f"    [Metadata] After strategy 1: {len(keywords_filtered)} keywords")
-            
-            # Strategy 2: Generate variations of existing keywords (if insufficient)
-            if len(keywords_filtered) < 50:
-                existing_keywords_copy = keywords_filtered.copy()
-                for kw in existing_keywords_copy:
-                    if len(keywords_filtered) >= 50:
-                        break
-                    
-                    # Plural
-                    if not kw.endswith('s') and len(kw) >= 3:
-                        plural = kw + 's'
-                        if (plural not in title_words_set and
-                            plural not in desc_words_set and
-                            plural not in keywords_filtered_set and
-                            plural not in stop_words):
-                            keywords_filtered.append(plural)
-                            keywords_filtered_set.add(plural)
-                            if len(keywords_filtered) >= 50:
-                                break
-                    
-                    # Singular (remove 's')
-                    if kw.endswith('s') and len(kw) > 3:
-                        singular = kw[:-1]
-                        if (singular not in title_words_set and
-                            singular not in desc_words_set and
-                            len(singular) >= 3 and
-                            singular not in keywords_filtered_set and
-                            singular not in stop_words):
-                            keywords_filtered.append(singular)
-                            keywords_filtered_set.add(singular)
-                            if len(keywords_filtered) >= 50:
-                                break
-                    
-                    # Remove endings -ing, -ed, -er, -est, -ly
-                    for ending, length in [('ing', 3), ('ed', 2), ('er', 2), ('est', 3), ('ly', 2)]:
-                        if len(keywords_filtered) >= 50:
-                            break
-                        if kw.endswith(ending) and len(kw) > (3 + length):
-                            base = kw[:-length]
-                            if (base not in title_words_set and
-                                base not in desc_words_set and
-                                base not in keywords_filtered_set and
-                                len(base) >= 3 and
-                                base not in stop_words):
-                                keywords_filtered.append(base)
-                                keywords_filtered_set.add(base)
-                                if len(keywords_filtered) >= 50:
-                                    break
-                    
-                    if len(keywords_filtered) >= 50:
-                        break
-            
-            self.log_message.emit(f"    [Metadata] After strategy 2: {len(keywords_filtered)} keywords")
-            
-            # Strategy 3: Second pass through all_words_filtered for maximum collection
-            if len(keywords_filtered) < 50:
-                # Go through all words again, including those that might have been missed
-                for word in all_words_filtered:
-                    if len(keywords_filtered) >= 50:
-                        break
-                    if (word not in title_words_set and
-                        word not in desc_words_set and
-                        word not in keywords_filtered_set):
-                        keywords_filtered.append(word)
-                        keywords_filtered_set.add(word)
-            
-            self.log_message.emit(f"    [Metadata] After strategy 3: {len(keywords_filtered)} keywords")
-            
-            # Strategy 4: If still insufficient, пробуем добавить wordsа длиной 2 символа (but not stop words)
-            if len(keywords_filtered) < 50:
-                meaningful_short_words = {"at", "be", "by", "do", "go", "he", "if", "in", "is", "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we"}
-                all_words_all_lengths = self.normalize_words(all_text)
-                for word in all_words_all_lengths:
-                    if len(keywords_filtered) >= 50:
-                        break
-                    if (len(word) == 2 and
-                        word not in meaningful_short_words and
-                        word not in stop_words and
-                        word not in title_words_set and
-                        word not in desc_words_set and
-                        word not in keywords_filtered_set):
-                        keywords_filtered.append(word)
-                        keywords_filtered_set.add(word)
-            
-            self.log_message.emit(f"    [Metadata] After strategy 4: {len(keywords_filtered)} keywords")
-            
-            # Final check: if still insufficient, log warning
-            if len(keywords_filtered) != 50:
-                self.log_message.emit(f"    ⚠ WARNING: Only managed to collect {len(keywords_filtered)} keywords instead of 50. Requirements not met.")
-            
-            keywords = ', '.join(keywords_filtered[:50])
-            
-            # STEP 7: Final validation before writing
-            title_words_final_set = set(self.normalize_words(title))
-            desc_words_final_set = set(self.normalize_words(description))
-            keywords_final_set = set([kw.lower() for kw in keywords_filtered])
-            
-            self.log_message.emit(f"    [Metadata] STEP 7: Финальная валидация...")
-            
-            # Проверка: title и description не должны иметь общих words (CRITICAL!)
-            common_title_desc = title_words_final_set & desc_words_final_set
+            # STEP 4: Final validation
+            common_title_desc = title_words_set & desc_words_set
             if common_title_desc:
-                error_msg = f"❌ CRITICAL ERROR: Title and Description contain common words: {common_title_desc}. This violates requirements (0% intersection)."
-                self.log_message.emit(f"    {error_msg}")
-                self.log_message.emit(f"    [Metadata] Debug information: title='{title[:50]}...', description='{description[:50]}...'")
-                raise Exception(error_msg)
-            
-            # Проверка: description и keywords не должны иметь общих words (CRITICAL!)
-            common_desc_kw = desc_words_final_set & keywords_final_set
+                raise Exception(f"❌ CRITICAL ERROR: Title and Description contain common words: {common_title_desc}")
+            common_desc_kw = desc_words_set & set(keywords_list)
             if common_desc_kw:
-                error_msg = f"❌ CRITICAL ERROR: Description and Keywords contain common words: {common_desc_kw}. This violates requirements (0% intersection)."
-                self.log_message.emit(f"    {error_msg}")
-                self.log_message.emit(f"    [Metadata] Debug information: description='{description[:50]}...', keywords_count={len(keywords_filtered)}")
-                raise Exception(error_msg)
-            
-            # Проверка: keywords должно быть ровно 50 (CRITICAL!)
-            if len(keywords_filtered) != 50:
-                error_msg = f"❌ CRITICAL ERROR: Keywords contains {len(keywords_filtered)} words instead of 50. This violates requirements."
-                self.log_message.emit(f"    {error_msg}")
-                raise Exception(error_msg)
-            
-            # Проверка: description должен быть 15-80 characters
+                raise Exception(f"❌ CRITICAL ERROR: Description and Keywords contain common words: {common_desc_kw}")
             if len(description) < 15 or len(description) > 80:
-                error_msg = f"❌ CRITICAL ERROR: Description contains {len(description)} characters (requires 15-80). This violates requirements."
-                self.log_message.emit(f"    {error_msg}")
-                raise Exception(error_msg)
+                raise Exception(f"❌ CRITICAL ERROR: Description contains {len(description)} characters (requires 15-80)")
             
-            self.log_message.emit(f"    ✓ AI аналfrom завершен: title='{title}' ({len(title_words_final)} words), description='{description[:30]}...' ({len(desc_words_final_set)} уникальных words), keywords={len(keywords_filtered)} words")
+            self.log_message.emit(f"    ✓ AI analysis completed: title={len(title_words)} words, description={len(description)} characters, keywords={len(keywords_list)} words")
             
             return {
                 'title': title,
                 'description': description,
                 'keywords': keywords,
-                'category': 'Photography',
+                'category': category,
                 'model_release': 'No'
             }
         
@@ -1022,7 +823,7 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
         title = cleaned_stem.replace('_', ' ').replace('-', ' ').title()
         title = ' '.join(title.split())
         
-        keywords = self.extract_words(cleaned_stem, max_words=50)
+        keywords = self.extract_words(cleaned_stem, max_words=MAX_KEYWORDS)
         
         keyword_set = set(keywords.lower().replace(', ', ',').split(','))
         description_words = [w for w in cleaned_stem.lower().split() if w not in keyword_set]
@@ -1052,7 +853,7 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
             'title': title,
             'description': description,
             'keywords': keywords,
-            'category': 'Photography',
+            'category': category,
             'model_release': 'No'
         }
     
@@ -1162,6 +963,18 @@ Analyze the image NOW and return ONLY the JSON object with EXACTLY 50 keywords."
         except Exception as e:
             raise Exception(f"Error writing metadata: {str(e)}")
     
+    def write_video_csv_row(self, filename, metadata):
+        """Appends video metadata to Adobe Stock CSV (Filename, Title, Keywords, Category, Releases)"""
+        csv_path = Path(self.output_folder) / VIDEO_CSV_NAME
+        mode = 'a' if self._video_csv_started else 'w'
+        with open(csv_path, mode, newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not self._video_csv_started:
+                writer.writerow(['Filename', 'Title', 'Keywords', 'Category', 'Releases'])
+            writer.writerow([filename, metadata.get('title', ''), metadata.get('keywords', ''), '', ''])
+        self._video_csv_started = True
+        self.log_message.emit(f"    [Write] Video metadata added to {VIDEO_CSV_NAME} (video file is not copied)")
+    
     def write_iptc_with_exiftool(self, image_path, title, description, keywords_list):
         """Writes IPTC metadata through exiftool (for compatibility with macOS Photos)"""
         self.log_message.emit(f"    [Write IPTC] Starting IPTC metadata write through exiftool...")
@@ -1248,7 +1061,7 @@ class EditDialog(QDialog):
 class KeyCutterApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TagStock PhotoKey - Batch image processing for stock")
+        self.setWindowTitle(f"TagStock PhotoKey {__version__} - Batch image processing for stock")
         self.setGeometry(100, 100, 1200, 800)
         
         # Set window icon
@@ -1314,7 +1127,7 @@ class KeyCutterApp(QMainWindow):
                 print(f"Failed to load logo: {e}")
         
         # Select folder with JPEG images
-        folder_group = QGroupBox("Folder with source JPEG files")
+        folder_group = QGroupBox("Folder with source JPEG and video files (MOV, MP4, MPG)")
         folder_layout = QHBoxLayout()
         self.folder_path_edit = QLineEdit()
         self.folder_path_edit.setReadOnly(True)
@@ -1326,7 +1139,7 @@ class KeyCutterApp(QMainWindow):
         layout.addWidget(folder_group)
         
         # Select folder for saving processed files
-        output_group = QGroupBox("Folder for saving processed JPEG files")
+        output_group = QGroupBox("Folder for saving processed files")
         output_layout = QHBoxLayout()
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setReadOnly(True)
@@ -1345,9 +1158,8 @@ class KeyCutterApp(QMainWindow):
         api_key_layout = QHBoxLayout()
         api_key_label = QLabel("API Key (GPT):")
         self.api_key_edit = QLineEdit()
-        # Automatic API key by default
-        default_api_key = "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"
-        self.api_key_edit.setText(default_api_key)
+        # Last used key from keychain, otherwise OPENAI_API_KEY environment variable
+        self.api_key_edit.setText(load_saved_api_key() or os.getenv('OPENAI_API_KEY', ''))
         self.api_key_edit.setPlaceholderText("sk-... (OpenAI GPT API key)")
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         api_key_layout.addWidget(api_key_label)
@@ -1386,13 +1198,13 @@ class KeyCutterApp(QMainWindow):
         layout.addWidget(log_group)
     
     def select_input_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select folder with JPEG files")
+        folder = QFileDialog.getExistingDirectory(self, "Select folder with JPEG and video files")
         if folder:
             self.folder_path_edit.setText(folder)
             self.selected_folder = folder
     
     def select_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select folder for saving processed JPEG files")
+        folder = QFileDialog.getExistingDirectory(self, "Select folder for saving processed files")
         if folder:
             self.output_path_edit.setText(folder)
             self.output_folder = folder
@@ -1421,6 +1233,13 @@ class KeyCutterApp(QMainWindow):
         
         # Create and start thread
         api_key = self.api_key_edit.text().strip() if hasattr(self, 'api_key_edit') and self.api_key_edit.text().strip() else None
+        
+        # Remember the key for next launch
+        if api_key and api_key != load_saved_api_key():
+            if save_api_key(api_key):
+                self.log("[UI] API key saved to keychain, it will be used on next launch")
+            else:
+                self.log("[UI] ⚠ Failed to save API key to keychain")
         
         self.log(f"[UI] Creating processing thread: api_type=openai (GPT), generate_metadata=True")
         
@@ -1483,7 +1302,7 @@ class KeyCutterApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "Done",
-                f"Processing completed!\nProcessed JPEG files with metadata saved to output folder."
+                f"Processing completed!\nPhotos with metadata and {VIDEO_CSV_NAME} (for videos) saved to output folder.\nSee the log for videos that do not meet Adobe Stock requirements."
             )
         else:
             self._processing_stopped = False  # Reset flag
