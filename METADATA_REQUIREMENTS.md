@@ -32,7 +32,7 @@
 - ✅ **Natural sentence from image analysis** - the AI writes one grammatical sentence; it is kept as a phrase (not rebuilt from separate words)
 - ✅ **Must NOT repeat title** - CRITICALLY IMPORTANT: if the AI sentence uses title (or generic) words, a second text-only request asks the AI to rewrite it without them; any remaining title words are removed
 - ✅ **Must NOT share words with keywords** - CRITICALLY IMPORTANT: description words are removed from keywords
-- ✅ **15-80 characters, more than 5 words** - truncated at a word boundary, never ends with an article or preposition
+- ✅ **15-80 characters, more than 5 words** - a longer sentence is rewritten by the AI; truncation at a word boundary is only a fallback and never ends with an article or preposition
 - ✅ **English text only, no special characters**
 - ✅ **Format** - first letter capital
 - ✅ Articles and prepositions (a, the, on, with...) are allowed for grammar

@@ -31,6 +31,15 @@ try:
 except ImportError:
     KEYRING_AVAILABLE = False
 
+class FatalAPIError(Exception):
+    """API error that makes further processing pointless (wrong key, no quota)"""
+
+
+def is_fatal_api_error(error_str):
+    markers = ["401", "invalid_api_key", "Incorrect API key", "insufficient_quota", "403", "model_not_found"]
+    return any(marker in error_str for marker in markers)
+
+
 # Last used API key is stored in system keychain (macOS Keychain)
 KEYRING_SERVICE = 'TagStock PhotoKey'
 KEYRING_USER = 'openai_api_key'
@@ -58,7 +67,7 @@ def save_api_key(api_key):
         print(f"Failed to save API key to keychain: {e}")
         return False
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # Local models removed - using only OpenAI API
 
@@ -174,6 +183,7 @@ class ProcessingThread(QThread):
         processed_count = 0
         rejected_videos = []  # (filename, [reasons]) - videos not meeting Adobe Stock requirements
         self._video_csv_started = False  # Adobe Stock CSV is recreated on each run
+        failed_files = []  # (filename, error) - files skipped because metadata generation failed
         self.log_message.emit(f"[Processing] Starting processing of {total} files...")
         
         for idx, image_path in enumerate(image_files, 1):
@@ -225,16 +235,21 @@ class ProcessingThread(QThread):
                     try:
                         metadata = self.analyze_and_generate_metadata(output_file_path, video_info)
                         self.log_message.emit(f"[Processing] Metadata successfully generated for file {idx}/{total}")
-                    except Exception as e:
-                        # If API error, stop processing
-                        error_msg = str(e)
-                        self.log_message.emit(f"    ❌ [Processing] CRITICAL ERROR: {error_msg}")
-                        import traceback
-                        self.log_message.emit(f"    [Processing] Error details: {traceback.format_exc()}")
-                        self.log_message.emit("[Processing] Processing stopped due to API error")
+                    except FatalAPIError as e:
+                        # Wrong key / no quota: stop, other files would fail the same way
+                        self.log_message.emit(f"    ❌ [Processing] CRITICAL ERROR: {str(e)}")
+                        self.log_message.emit("[Processing] Processing stopped: check API key and balance")
                         self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
                         self.finished.emit([])
                         return
+                    except Exception as e:
+                        # Error for this file only: skip it and continue with others
+                        self.log_message.emit(f"    ❌ [Processing] Failed to generate metadata for {image_path.name}: {str(e)}")
+                        failed_files.append((image_path.name, str(e)))
+                        if not video_info and output_file_path.exists():
+                            output_file_path.unlink()  # do not leave a photo copy without metadata
+                        self.progress.emit(idx, total)
+                        continue
                     
                     # Check for stop request after analysis
                     if self._stop_requested:
@@ -281,6 +296,10 @@ class ProcessingThread(QThread):
             self.log_message.emit(f"[Processing] Results saved to: {self.output_folder}")
             if self._video_csv_started:
                 self.log_message.emit(f"[Processing] Video metadata CSV for Adobe Stock: {Path(self.output_folder) / VIDEO_CSV_NAME}")
+            if failed_files:
+                self.log_message.emit(f"[Processing] ⚠ Files skipped (metadata generation failed, run again to retry): {len(failed_files)}")
+                for name, error in failed_files:
+                    self.log_message.emit(f"    ✗ {name}: {error}")
             if rejected_videos:
                 self.log_message.emit(f"[Processing] ⚠ Videos skipped (do not meet Adobe Stock requirements): {len(rejected_videos)}")
                 for name, reasons in rejected_videos:
@@ -392,9 +411,8 @@ class ProcessingThread(QThread):
                 result = self._analyze_with_openai_api(frames, api_key, is_video=True)
         else:
             result = self._analyze_with_openai_api([image_path], api_key)
-        # If OpenAI API failed (error, quota, etc.), stop processing
         if result is None:
-            error_msg = "ERROR: OpenAI API is not working (check quota and API key). Processing stopped."
+            error_msg = "ERROR: No valid response from AI after 2 attempts (see log above)"
             self.log_message.emit(f"    ❌ {error_msg}")
             raise Exception(error_msg)
         self.log_message.emit(f"    [AI] OpenAI GPT API returned result: title={result.get('title', '')[:30] if result else 'None'}...")
@@ -438,52 +456,45 @@ class ProcessingThread(QThread):
             # Use standard OpenAI endpoint
             self.log_message.emit(f"    [OpenAI] Using standard OpenAI endpoint")
             client = OpenAI(api_key=api_key)
-            
-            self.log_message.emit(f"    [OpenAI] Sending request to API (model: {OPENAI_MODEL})...")
-            
-            # Request to API for image analysis
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                reasoning_effort="none",  # temperature is rejected when reasoning is on
-                messages=self._build_messages(images_data, is_video),
-                max_completion_tokens=1500,  # Enough for complete JSON with 65 keywords
-                temperature=0.3
-            )
+            messages = self._build_messages(images_data, is_video)
+        except Exception as e:
+            self.log_message.emit(f"    ❌ Error preparing request: {str(e)}")
+            return None
+        
+        # Two attempts: retry on invalid JSON, rate limit or temporary API error
+        for attempt in (1, 2):
+            try:
+                self.log_message.emit(f"    [OpenAI] Sending request to API (model: {OPENAI_MODEL}, attempt {attempt}/2)...")
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    reasoning_effort="none",  # temperature is rejected when reasoning is on
+                    messages=messages,
+                    response_format={"type": "json_object"},  # guarantees valid JSON
+                    max_completion_tokens=1500,  # Enough for complete JSON with 65 keywords
+                    temperature=0.3
+                )
+            except Exception as e:
+                error_str = str(e)
+                if is_fatal_api_error(error_str):
+                    # Wrong key or no money: other files will fail the same way
+                    raise FatalAPIError(f"OpenAI API error: {error_str[:300]}")
+                self.log_message.emit(f"    ⚠ [OpenAI] Request error: {error_str[:300]}")
+                if attempt == 1:
+                    if "rate limit" in error_str.lower() or "429" in error_str:
+                        self.log_message.emit(f"    ⚠ Rate limit reached, waiting 60 seconds...")
+                        time.sleep(60)
+                    continue
+                return None
             
             self.log_message.emit(f"    [OpenAI] Response received from API")
-            
-            # Parse response
-            content = response.choices[0].message.content.strip()
+            content = (response.choices[0].message.content or '').strip()
             self.log_message.emit(f"    [OpenAI] AI response received, length: {len(content)} characters")
-            
-            return self._parse_ai_response(content)
-                
-        except Exception as e:
-            error_str = str(e)
-            # Handle rate limit errors
-            if "rate limit" in error_str.lower() or "429" in error_str:
-                self.log_message.emit(f"    ⚠ Rate limit reached, waiting 60 seconds...")
-                time.sleep(60)  # Wait 60 seconds on rate limit
-                # Try to retry request once
-                try:
-                    self.log_message.emit(f"    [OpenAI] Retrying after rate limit...")
-                    response = client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        reasoning_effort="none",
-                        messages=self._build_messages(images_data, is_video),
-                        max_completion_tokens=1500,
-                        temperature=0.3
-                    )
-                    content = response.choices[0].message.content.strip()
-                    self.log_message.emit(f"    [OpenAI] Response received after retry")
-                    return self._parse_ai_response(content)
-                except Exception as e2:
-                    self.log_message.emit(f"    ❌ Error on retry: {str(e2)}")
-            
-            self.log_message.emit(f"    ❌ Error analyzing through OpenAI API: {error_str}")
-            import traceback
-            self.log_message.emit(f"    [OpenAI] Error details: {traceback.format_exc()}")
-            return None
+            result = self._parse_ai_response(content)
+            if result:
+                return result
+            if attempt == 1:
+                self.log_message.emit(f"    ⚠ [OpenAI] Invalid JSON in AI response, retrying...")
+        return None
     
     def _rewrite_description(self, description, forbidden_words):
         """Text-only request: rewrites description without forbidden words. Returns None on failure"""
@@ -493,22 +504,34 @@ class ProcessingThread(QThread):
                   f"40-80 characters, no special characters. Keep the meaning. "
                   f"Do NOT use any of these words or their forms: {', '.join(forbidden_words)}.\n\n"
                   f"Sentence: {description}\n\nReturn ONLY the new sentence.")
+        rewritten = None
         try:
             client = OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                reasoning_effort="none",
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=100,
-                temperature=0.3
-            )
-            rewritten = self.clean_text(response.choices[0].message.content or '')
-            if set(self.normalize_words(rewritten)) & set(forbidden_words):
-                self.log_message.emit(f"    [Metadata] Rewritten description still uses forbidden words, they will be removed")
-            return rewritten or None
+            # Second attempt only if the first rewrite still uses forbidden words
+            for attempt in (1, 2):
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    reasoning_effort="none",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=100,
+                    temperature=0.3 if attempt == 1 else 0.7
+                )
+                rewritten = self.clean_text(response.choices[0].message.content or '') or rewritten
+                used = set(self.normalize_words(rewritten or '')) & set(forbidden_words)
+                too_long = len(rewritten or '') > 80
+                if not used and not too_long:
+                    return rewritten
+                problems = []
+                if used:
+                    problems.append(f"still uses {sorted(used)}")
+                if too_long:
+                    problems.append(f"is {len(rewritten)} characters")
+                self.log_message.emit(f"    [Metadata] Rewritten description {' and '.join(problems)}" +
+                                      (", retrying..." if attempt == 1 else ", fixing it in code"))
+            return rewritten
         except Exception as e:
             self.log_message.emit(f"    ⚠ [Metadata] Description rewrite failed: {str(e)}")
-            return None
+            return rewritten
     
     def _parse_ai_response(self, content):
         """Parses AI response and extracts metadata"""
@@ -729,10 +752,14 @@ class ProcessingThread(QThread):
             title_words = list(dict.fromkeys(
                 w for w in self.normalize_words(title_raw) if len(w) >= 3 and w not in STOP_WORDS))
             if len(title_words) <= 5:
-                for word in all_words_filtered:
+                # Supplement from AI keywords, avoiding description words (otherwise description loses them)
+                desc_raw_words = set(self.normalize_words(description_raw))
+                ai_keywords = [w for kw in keywords_str_raw.split(',') for w in self.normalize_words(kw)[:1]]
+                for word in ai_keywords + all_words_filtered:
                     if len(title_words) >= 6:
                         break
-                    if word not in title_words:
+                    if (word not in title_words and word not in desc_raw_words and
+                            len(word) >= 3 and word not in STOP_WORDS):
                         title_words.append(word)
             if required_words:
                 title_words = [w for w in title_words if w not in required_words]
@@ -747,10 +774,16 @@ class ProcessingThread(QThread):
             # STEP 2: DESCRIPTION - AI sentence without title words and generic words
             forbidden = sorted(set(w.lower() for w in description_raw.split())
                                & (title_words_set | DESCRIPTION_BANNED_WORDS))
-            if forbidden:
-                # Ask the model to rewrite the sentence instead of cutting words out of it
-                self.log_message.emit(f"    [Metadata] Description uses title/generic words {forbidden}, asking AI to rewrite...")
-                rewritten = self._rewrite_description(description_raw, sorted(title_words_set | set(forbidden)))
+            too_long = len(description_raw) > 80
+            if forbidden or too_long:
+                # Ask the model to rewrite the sentence instead of cutting words out of it or truncating it
+                reasons = []
+                if forbidden:
+                    reasons.append(f"uses title/generic words {forbidden}")
+                if too_long:
+                    reasons.append(f"is {len(description_raw)} characters (max 80)")
+                self.log_message.emit(f"    [Metadata] Description {' and '.join(reasons)}, asking AI to rewrite...")
+                rewritten = self._rewrite_description(description_raw, sorted(title_words_set | DESCRIPTION_BANNED_WORDS))
                 if rewritten:
                     self.log_message.emit(f"    [Metadata] Rewritten description: '{rewritten}'")
                     description_raw = rewritten

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+
+### Fixed
+- Requests use JSON mode (`response_format`) and are retried once on invalid JSON or a temporary API error
+- One failed file no longer stops the batch: it is skipped and listed at the end. Only key or balance errors stop processing
+- A description longer than 80 characters is rewritten by the AI instead of being cut off; the rewrite gets the full list of forbidden words and a second attempt
+- A short title is padded with AI keywords, not with description words
+
 ## 1.1.0
 
 ### Added
