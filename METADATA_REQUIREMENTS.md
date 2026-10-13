@@ -4,18 +4,21 @@
 
 ### Main Requirements:
 - ✅ **Generation based on image analysis** - title is formed exclusively based on AI analysis of image content
-- ✅ **Maximum 10 words** - title must contain no more than 10 words
-- ✅ **No word repetitions** - each word in title must be unique (not repeated)
+- ✅ **6-10 words** - title must contain no more than 10 words; a title of 5 words or less is padded with AI keywords (not description words, no singular/plural duplicates)
+- ✅ **Reads as a phrase** - linking words between content words are kept: "Railway Tracks and White Car Through Pine Forest", "Young Man Climbs Rocky Mound in Sunny Woodland"
+- ✅ **No word repetitions** - each content word in title must be unique (not repeated)
 - ✅ **English text only** - no other languages
 - ✅ **No special characters** - only English letters, numbers and spaces
 - ✅ **Uniqueness** - title should not repeat for different images (previous title is tracked)
-- ✅ **Format** - each word with capital letter (Title Case)
+- ✅ **Format** - each word with capital letter (Title Case); linking words of 3 letters or less (and, in, of...) are lowercase
+
+### Linking words (kept between content words, never first or last, never two in a row):
+- and, or, at, in, on, of, for, to, with, by, from, into, onto, through, toward, towards, past, over, under, beneath, beside, along, across, around, near, between, behind, above, below, inside, among, amid
+- They are **not title words**: the description may use them, keywords never contain them
 
 ### Excluded words (stop words):
 - Articles: the, a, an
-- Prepositions: of, in, on, at, to, for, with
 - Linking verbs: is, are, was, were
-- Conjunctions: and, or, but
 - Demonstrative pronouns: this, that, these, those
 - Personal pronouns: it, its, they, them, what, you
 - Common words: see, image, photography, photo, picture, detailed, describe, scene, happening, showing, view
@@ -30,9 +33,10 @@
 
 ### Main Requirements:
 - ✅ **Natural sentence from image analysis** - the AI writes one grammatical sentence; it is kept as a phrase (not rebuilt from separate words)
-- ✅ **Must NOT repeat title** - CRITICALLY IMPORTANT: if the AI sentence uses title (or generic) words, a second text-only request asks the AI to rewrite it without them; any remaining title words are removed
+- ✅ **Must NOT repeat title** - CRITICALLY IMPORTANT: if the AI sentence uses title content words (or generic words), a text-only request asks the AI to rewrite it without them - up to 3 attempts, each told what was wrong with the previous one. If no attempt is clean, the sentence is **cut before the first forbidden word** (at least 6 words must remain); words are never cut out of the middle of the sentence, except as a last resort
 - ✅ **Must NOT share words with keywords** - CRITICALLY IMPORTANT: description words are removed from keywords
-- ✅ **15-80 characters, more than 5 words** - a longer sentence is rewritten by the AI; truncation at a word boundary is only a fallback and never ends with an article or preposition
+- ✅ **15-80 characters, more than 5 words** - a longer sentence is rewritten by the AI; if it is still too long, it is cut before the last unfinished phrase ("...through sunny woods", not "...through sunny woods and rocky") and never ends with an article or preposition
+- ✅ **Hyphenated words** - hyphens, dashes and slashes become spaces ("forward facing", not "forwardfacing")
 - ✅ **English text only, no special characters**
 - ✅ **Format** - first letter capital
 - ✅ Articles and prepositions (a, the, on, with...) are allowed for grammar
@@ -73,7 +77,7 @@
 - ✅ Words for title, description and keywords are extracted from these descriptions
 
 ### Field Relationships:
-- ✅ Title and Description - must NOT have common words
+- ✅ Title and Description - must NOT have common words (linking words like "and", "through" are allowed)
 - ✅ Description and Keywords - must NOT have common words
 - ✅ Title and Keywords - no common words (except "vertical, video" for vertical clips)
 
@@ -114,6 +118,7 @@
 
 - All requirements are strictly followed in the code
 - If any requirement is violated, a warning is generated in logs
+- The log of every run is saved to `logs/run_YYYY-MM-DD_HH-MM-SS.log` (see README, section "Logs")
 - If fewer than 25 keywords remain after filtering, a warning is displayed
 - Description is always checked for common phrases and recreated if necessary
 

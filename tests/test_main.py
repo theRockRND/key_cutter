@@ -36,8 +36,12 @@ def words(text):
     return set(text.lower().replace(',', ' ').split())
 
 
+LOGS_TMP = tempfile.TemporaryDirectory()
+
+
 def make_thread(api_key="sk-test", input_folder=".", output_folder="."):
     thread = main.ProcessingThread(input_folder, output_folder, api_key=api_key)
+    thread.logs_folder = Path(LOGS_TMP.name)
     thread.logs = []
     thread.log_message.connect(thread.logs.append)
     return thread
@@ -74,7 +78,7 @@ class MetadataRulesTest(unittest.TestCase):
         self.thread = make_thread()
 
     def check_common_rules(self, metadata):
-        title_words = words(metadata['title'])
+        title_words = words(metadata['title']) - main.TITLE_CONNECTORS
         desc_words = words(metadata['description'])
         keywords = metadata['keywords'].split(', ')
         self.assertLessEqual(len(keywords), main.MAX_KEYWORDS)
@@ -111,10 +115,18 @@ class MetadataRulesTest(unittest.TestCase):
         self.assertEqual(len(metadata['title'].split()), 10)
         self.assertTrue(metadata['title'].endswith("Vertical Video"))
 
-    def test_stop_words_removed_from_title(self):
+    def test_linking_words_kept_in_title(self):
         response = dict(AI_RESPONSE, title="Snow Covered Park Path With Trees And Benches In Winter")
         metadata = generate(self.thread, response)
-        self.assertEqual(metadata['title'], "Snow Covered Park Path Trees Benches Winter")
+        self.assertEqual(metadata['title'], "Snow Covered Park Path With Trees and Benches in Winter")
+        self.check_common_rules(metadata)
+
+    def test_linking_words_allowed_in_description(self):
+        response = dict(AI_RESPONSE, description="Clear water rushes through mossy boulders under a cloudy sky")
+        metadata = generate(self.thread, response, HD)
+        self.thread._rewrite_description.assert_not_called()
+        self.assertEqual(metadata['description'], response['description'])
+        self.assertNotIn('through', metadata['keywords'].split(', '))
 
     def test_no_generated_keyword_variations(self):
         response = dict(AI_RESPONSE, keywords="swings, swing, posts, post, cold, blue, river, winter")
@@ -137,8 +149,13 @@ class MetadataRulesTest(unittest.TestCase):
                     "description": "A carrot nosed figure stands amid deep drifts as the camera pulls back",
                     "keywords": "snowman, snow, sticks, twig, carrot, drifts, " + AI_RESPONSE['keywords']}
         metadata = generate(self.thread, response, HD)
-        self.assertEqual(metadata['title'], "Snowman Stick Arms Winter Park Snow")
+        self.assertEqual(metadata['title'], "Snowman With Stick Arms in Winter Park")
         self.assertIn('carrot', metadata['description'])
+
+        response = dict(response, title="Snowman Stick Arms")
+        metadata = generate(self.thread, response, HD)
+        self.assertEqual(metadata["title"], "Snowman Stick Arms Snow Twig Mountain")  # not "Sticks", not "Drifts"
+        self.assertIn('drifts', metadata['description'])  # padding does not take description words
 
     def test_description_rewrite_when_title_words_used(self):
         response = dict(AI_RESPONSE, description="Clear river water rushes past mossy boulders in the forest")
@@ -169,9 +186,65 @@ class MetadataRulesTest(unittest.TestCase):
         self.assertNotIn('river', words(metadata['description']))
 
 
+class BuildTitleTest(unittest.TestCase):
+    def setUp(self):
+        self.thread = make_thread()
+
+    def title(self, raw, padding=(), required=()):
+        return self.thread.build_title(raw, list(padding), list(required))[0]
+
+    def test_titles_from_real_run(self):
+        self.assertEqual(self.title("Railway Tracks And White Car Through A Pine Forest"),
+                         "Railway Tracks and White Car Through Pine Forest")
+        self.assertEqual(self.title("Young Man Climbs Rocky Mound In Sunny Woodland"),
+                         "Young Man Climbs Rocky Mound in Sunny Woodland")
+        self.assertEqual(self.title("Historic Railway Yard With Signal Tower And Walking Man"),
+                         "Historic Railway Yard With Signal Tower and Walking Man")
+
+    def test_connectors_are_not_title_words(self):
+        title, content = self.thread.build_title("Railway Tracks Lead Through Dark Tunnel Toward Daylight", [])
+        self.assertEqual(title, "Railway Tracks Lead Through Dark Tunnel Toward Daylight")
+        self.assertNotIn('through', content)
+        self.assertNotIn('toward', content)
+
+    def test_no_connector_at_edges_or_doubled(self):
+        self.assertEqual(self.title("In The Forest Of And Pines Along Rocky Cliffs With", ['moss']),
+                         "Forest of Pines Along Rocky Cliffs")
+
+    def test_limit_10_words_without_trailing_connector(self):
+        title = self.title("One Two Three Four Five Six Seven Eight Nine And Ten Eleven")
+        self.assertEqual(title, "One Two Three Four Five Six Seven Eight Nine")
+        title = self.title("One Two Three Four Five Six Seven And Eight Nine", required=['vertical', 'video'])
+        self.assertEqual(title, "One Two Three Four Five Six Seven Vertical Video")
+
+
 class BuildDescriptionTest(unittest.TestCase):
     def setUp(self):
         self.thread = make_thread()
+
+    def test_cuts_before_forbidden_word_instead_of_removing_it(self):
+        cases = {
+            ("The camera moves along a dim passage toward a sunlit forest", 'toward'):
+                "The camera moves along a dim passage",
+            ("A moving viewpoint enters sunlit woods as the tunnel fades behind it", 'tunnel'):
+                "A moving viewpoint enters sunlit woods",
+            ("A moving viewpoint follows a winding path beneath trees and into darkness", 'into'):
+                "A moving viewpoint follows a winding path beneath trees",
+        }
+        for (text, word), expected in cases.items():
+            self.assertEqual(self.thread.build_description(text, {word}), expected)
+
+    def test_truncates_before_unfinished_phrase(self):
+        cases = {
+            "A forward moving shot follows a winding path through sunny woods and rocky hillsides":
+                "A forward moving shot follows a winding path through sunny woods",
+            "A historic train moves slowly by passengers under sunny skies and wooded hillsides":
+                "A historic train moves slowly by passengers under sunny skies",
+            "The distant opening grows smaller as the camera moves underground along the rails":
+                "The distant opening grows smaller as the camera moves underground",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(self.thread.build_description(text, set()), expected)
 
     def test_removes_title_and_generic_words(self):
         result = self.thread.build_description("A quiet park scene with snowy trees beside the frozen lake",
@@ -296,6 +369,20 @@ class RewriteDescriptionTest(unittest.TestCase):
         self.assertEqual(result, "A quiet snowy garden on a calm winter day")
         self.assertEqual(len(calls), 2)
 
+    def test_three_attempts_with_feedback(self):
+        result, calls = self.rewrite(["A quiet park", "A calm park in snow", "A quiet snowy garden on a calm winter day"])
+        self.assertEqual(result, "A quiet snowy garden on a calm winter day")
+        self.assertEqual(len(calls), 3)
+        feedback = calls[1]['messages'][-1]['content']
+        self.assertIn('park', feedback)
+        self.assertEqual(calls[1]['messages'][-2], {"role": "assistant", "content": "A quiet park"})
+
+    def test_best_attempt_returned_when_none_is_clean(self):
+        too_long = "A quiet snowy garden with frosted hedges and benches on a calm and bright winter day"
+        result, calls = self.rewrite(["A quiet park scene", too_long, "A park in snow"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result, too_long)  # no forbidden words: only too long, cut in code later
+
     def test_error_returns_none(self):
         result, _ = self.rewrite([Exception("Error code: 500")])
         self.assertIsNone(result)
@@ -305,6 +392,13 @@ class RewriteDescriptionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             thread.api_key = None
             self.assertIsNone(thread._rewrite_description("text", ['park']))
+
+
+class CleanTextTest(unittest.TestCase):
+    def test_hyphen_separates_words(self):
+        thread = make_thread()
+        self.assertEqual(thread.clean_text("A forward-facing shot of old\u2014fashioned cars/trains!"),
+                         "A forward facing shot of old fashioned cars trains")
 
 
 class KeychainTest(unittest.TestCase):
@@ -400,6 +494,13 @@ class BatchProcessingTest(unittest.TestCase):
 
         log = '\n'.join(thread.logs)
         self.assertIn('Files found: 1 JPEG, 4 video', log)
+        # Log of the run is saved to a file in the logs folder, not in the output folder
+        self.assertEqual(thread.log_file_path.parent, thread.logs_folder)
+        self.assertRegex(thread.log_file_path.name, r'^run_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.log$')
+        saved = thread.log_file_path.read_text(encoding='utf-8')
+        self.assertIn(f'TagStock PhotoKey {main.__version__}', saved)
+        self.assertIn('Files found: 1 JPEG, 4 video', saved)
+        self.assertIn(f'Log saved to: {thread.log_file_path}', saved)
         self.assertIn('c_720p.mp4: width 1280px is below minimum 1920px', log)
         self.assertIn('d_short.mp4: duration 3.00s is out of range 5-60s', log)
 
@@ -431,9 +532,15 @@ class BatchProcessingTest(unittest.TestCase):
             calls.append(path.name)
             raise main.FatalAPIError("OpenAI API error: Error code: 401")
 
-        thread = self.run_batch(analyze)
+        finished = []
+        thread = make_thread(input_folder=str(self.input), output_folder=str(self.output))
+        thread.analyze_image_with_ai = analyze
+        thread.finished.connect(finished.append)
+        thread.run()
         self.assertEqual(calls, ['a_ok.mp4'])
         self.assertIn('Processing stopped: check API key and balance', '\n'.join(thread.logs))
+        self.assertEqual(finished, [[]])  # finished is emitted once, after the log file is saved
+        self.assertIn('Processing stopped: check API key and balance', thread.log_file_path.read_text())
 
     def test_csv_is_recreated_on_new_run(self):
         self.run_batch(lambda path, info=None: dict(AI_RESPONSE))
