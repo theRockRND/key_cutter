@@ -115,12 +115,13 @@ Video support requires **ffmpeg** (`brew install ffmpeg`).
 ### Metadata Generation Rules:
 
 **Title:**
-- English text only (a-z, A-Z, 0-9, spaces)
-- No special characters
-- Automatic formatting from filename
+- English text only (a-z, A-Z, 0-9, spaces), no special characters
+- 6-10 words, reads as a phrase: linking words between content words are kept ("Railway Tracks and White Car Through Pine Forest")
+- Without AI analysis: formatted from filename
 
 **Description:**
-- One natural English sentence from the AI, without title words
+- One natural English sentence from the AI, without title content words (linking words like "and", "through" are allowed)
+- If it uses title words or is longer than 80 characters, the AI rewrites it (up to 3 attempts); words are not cut out of the middle of the sentence
 - Does not share words with keywords
 - 15-80 characters
 
@@ -152,6 +153,29 @@ Metadata is written to image files via:
 - **PNG/TIFF:** Metadata via Pillow
 
 Stock sites (Adobe Stock, Shutterstock, Getty Images, etc.) automatically read this metadata when uploading.
+
+## Logs
+
+The full log of every run is saved to the `logs/` folder next to `main.py`:
+
+```
+logs/run_2026-10-13_21-36-06.log
+```
+
+- one file per run, named by its start time; written when the run ends - also when it is stopped or stops on an error
+- the first line has the app version and the AI model; the path is shown at the start and end of the log and in the completion message
+- `logs/` is not committed to git
+
+To get a run analyzed, attach the file (or give its path) instead of copying the log from the window.
+
+## Tests
+
+```bash
+source venv/bin/activate
+python -m unittest discover -s tests -t .
+```
+
+Tests use only the standard library and a fake OpenAI client (no API key and no network needed). Tests that need ffmpeg are skipped if it is not installed.
 
 ## Requirements
 

@@ -31,6 +31,15 @@ try:
 except ImportError:
     KEYRING_AVAILABLE = False
 
+class FatalAPIError(Exception):
+    """API error that makes further processing pointless (wrong key, no quota)"""
+
+
+def is_fatal_api_error(error_str):
+    markers = ["401", "invalid_api_key", "Incorrect API key", "insufficient_quota", "403", "model_not_found"]
+    return any(marker in error_str for marker in markers)
+
+
 # Last used API key is stored in system keychain (macOS Keychain)
 KEYRING_SERVICE = 'TagStock PhotoKey'
 KEYRING_USER = 'openai_api_key'
@@ -58,7 +67,7 @@ def save_api_key(api_key):
         print(f"Failed to save API key to keychain: {e}")
         return False
 
-__version__ = "1.1.0"
+__version__ = "1.1.3"
 
 # Local models removed - using only OpenAI API
 
@@ -114,6 +123,22 @@ DESCRIPTION_BANNED_WORDS = {
 DESCRIPTION_TRAILING_WORDS = STOP_WORDS | {"between", "under", "over", "near", "into", "through", "across",
                                            "behind", "along", "around", "against", "beside", "below", "above"}
 
+# Words that start a new phrase: a description that is too long is cut before the last of them,
+# so it does not end with half a phrase ("...past sunny woods and rocky")
+DESCRIPTION_PHRASE_STARTS = {"and", "or", "but", "as", "while", "with", "through", "past", "under", "beneath",
+                             "near", "between", "along", "across", "toward", "towards", "into", "onto", "behind",
+                             "beside", "by", "from", "in", "on", "at", "of", "over", "around", "against", "below",
+                             "above", "among", "amid", "inside", "for", "to"}
+
+# Linking words kept inside a title so it reads as a phrase ("Tracks and White Car", "Man Climbs Rocks in Woodland").
+# They are not counted as title words: description may use them, keywords never do
+TITLE_CONNECTORS = {"and", "or", "at", "in", "on", "of", "for", "to", "with", "by", "from", "into", "onto",
+                    "through", "toward", "towards", "past", "over", "under", "beneath", "beside", "along",
+                    "across", "around", "near", "between", "behind", "above", "below", "inside", "among", "amid"}
+
+# Log of every run is saved here as run_YYYY-MM-DD_HH-MM-SS.log (next to main.py)
+LOGS_DIR = Path(__file__).resolve().parent / 'logs'
+
 VIDEO_PROMPT_INTRO = """The {count} images below are frames taken from the beginning, middle and end of ONE stock video clip. Treat them as a single video: describe the subject, action and motion over time, not separate photos.
 
 """
@@ -135,20 +160,52 @@ class ProcessingThread(QThread):
         self.previous_titles = set()  # Track previous titles to avoid duplicates
         self.previous_descriptions = set()  # Track previous descriptions
         self._stop_requested = False  # Flag for stopping processing
+        self.logs_folder = LOGS_DIR
+        self.log_file_path = None
+        self._log_lines = []
+        # Direct connection: lines are collected in the processing thread, in order, before the file is written
+        self.log_message.connect(self._remember_log_line, Qt.ConnectionType.DirectConnection)
     
     def stop(self):
         """Stops processing"""
         self._stop_requested = True
         self.log_message.emit("Stopping processing...")
         
+    def _remember_log_line(self, message):
+        self._log_lines.append(f"{datetime.now().strftime('%H:%M:%S')} - {message}")
+    
+    def save_log_file(self):
+        """Writes the log of this run to logs/run_YYYY-MM-DD_HH-MM-SS.log"""
+        try:
+            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_path.write_text('\n'.join(self._log_lines) + '\n', encoding='utf-8')
+        except Exception as e:
+            self.log_message.emit(f"⚠ [Processing] Failed to save log file {self.log_file_path}: {str(e)}")
+    
     def run(self):
+        started = datetime.now()
+        self._log_lines = [f"TagStock PhotoKey {__version__}, model {OPENAI_MODEL}, run started "
+                           f"{started.strftime('%Y-%m-%d %H:%M:%S')}"]
+        self.log_file_path = Path(self.logs_folder) / f"run_{started.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        try:
+            self._run()
+        except Exception as e:
+            import traceback
+            self.log_message.emit(f"  ✗ [Processing] Unexpected error: {str(e)}")
+            self.log_message.emit(traceback.format_exc())
+        finally:
+            self.save_log_file()
+            self.finished.emit([])
+    
+    def _run(self):
         self._stop_requested = False  # Reset stop flag on start
         self.log_message.emit("=" * 80)
         self.log_message.emit("[Processing] Starting processing...")
         self.log_message.emit(f"[Processing] Input folder: {self.input_folder}")
         self.log_message.emit(f"[Processing] Output folder: {self.output_folder}")
         self.log_message.emit(f"[Processing] Generate metadata: {self.generate_metadata}")
-        self.log_message.emit(f"[Processing] Using OpenAI API (GPT)")
+        self.log_message.emit(f"[Processing] Using OpenAI API (GPT), model: {OPENAI_MODEL}")
+        self.log_message.emit(f"[Processing] Log file (written when the run ends): {self.log_file_path}")
         
         # Find JPEG and video files (suffix check is case-insensitive, no duplicates on macOS)
         image_extensions = ['.jpg', '.jpeg']
@@ -163,7 +220,6 @@ class ProcessingThread(QThread):
         
         if total == 0:
             self.log_message.emit("[Processing] ERROR: JPEG or video files not found!")
-            self.finished.emit([])
             return
         
         # Create output folder if it doesn't exist
@@ -174,6 +230,7 @@ class ProcessingThread(QThread):
         processed_count = 0
         rejected_videos = []  # (filename, [reasons]) - videos not meeting Adobe Stock requirements
         self._video_csv_started = False  # Adobe Stock CSV is recreated on each run
+        failed_files = []  # (filename, error) - files skipped because metadata generation failed
         self.log_message.emit(f"[Processing] Starting processing of {total} files...")
         
         for idx, image_path in enumerate(image_files, 1):
@@ -181,7 +238,6 @@ class ProcessingThread(QThread):
             if self._stop_requested:
                 self.log_message.emit("[Processing] Processing stopped by user")
                 self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
-                self.finished.emit([])
                 return
             
             try:
@@ -211,7 +267,6 @@ class ProcessingThread(QThread):
                 if self._stop_requested:
                     self.log_message.emit("[Processing] Processing stopped by user")
                     self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
-                    self.finished.emit([])
                     return
                 
                 # Analyze file and generate metadata
@@ -225,22 +280,25 @@ class ProcessingThread(QThread):
                     try:
                         metadata = self.analyze_and_generate_metadata(output_file_path, video_info)
                         self.log_message.emit(f"[Processing] Metadata successfully generated for file {idx}/{total}")
-                    except Exception as e:
-                        # If API error, stop processing
-                        error_msg = str(e)
-                        self.log_message.emit(f"    ❌ [Processing] CRITICAL ERROR: {error_msg}")
-                        import traceback
-                        self.log_message.emit(f"    [Processing] Error details: {traceback.format_exc()}")
-                        self.log_message.emit("[Processing] Processing stopped due to API error")
+                    except FatalAPIError as e:
+                        # Wrong key / no quota: stop, other files would fail the same way
+                        self.log_message.emit(f"    ❌ [Processing] CRITICAL ERROR: {str(e)}")
+                        self.log_message.emit("[Processing] Processing stopped: check API key and balance")
                         self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
-                        self.finished.emit([])
                         return
+                    except Exception as e:
+                        # Error for this file only: skip it and continue with others
+                        self.log_message.emit(f"    ❌ [Processing] Failed to generate metadata for {image_path.name}: {str(e)}")
+                        failed_files.append((image_path.name, str(e)))
+                        if not video_info and output_file_path.exists():
+                            output_file_path.unlink()  # do not leave a photo copy without metadata
+                        self.progress.emit(idx, total)
+                        continue
                     
                     # Check for stop request after analysis
                     if self._stop_requested:
                         self.log_message.emit("[Processing] Processing stopped by user")
                         self.log_message.emit(f"[Processing] Processed files: {processed_count} of {total}")
-                        self.finished.emit([])
                         return
                     
                     self.log_message.emit(f"  ✓ Metadata generated:")
@@ -281,15 +339,18 @@ class ProcessingThread(QThread):
             self.log_message.emit(f"[Processing] Results saved to: {self.output_folder}")
             if self._video_csv_started:
                 self.log_message.emit(f"[Processing] Video metadata CSV for Adobe Stock: {Path(self.output_folder) / VIDEO_CSV_NAME}")
+            if failed_files:
+                self.log_message.emit(f"[Processing] ⚠ Files skipped (metadata generation failed, run again to retry): {len(failed_files)}")
+                for name, error in failed_files:
+                    self.log_message.emit(f"    ✗ {name}: {error}")
             if rejected_videos:
                 self.log_message.emit(f"[Processing] ⚠ Videos skipped (do not meet Adobe Stock requirements): {len(rejected_videos)}")
                 for name, reasons in rejected_videos:
                     self.log_message.emit(f"    ✗ {name}: {'; '.join(reasons)}")
+            self.log_message.emit(f"[Processing] Log saved to: {self.log_file_path}")
             self.log_message.emit("=" * 80)
         else:
             self.log_message.emit("[Processing] Processing was stopped by user")
-        
-        self.finished.emit([])
     
     def check_video(self, video_path):
         """Checks video against Adobe Stock technical requirements. Returns (video_info, errors)"""
@@ -321,8 +382,10 @@ class ProcessingThread(QThread):
     
     def clean_text(self, text):
         """Cleans text from special characters, keeps only English letters, numbers and spaces"""
+        # Hyphens, dashes and slashes separate words: "forward-facing" -> "forward facing", not "forwardfacing"
+        cleaned = re.sub(r'[-\u2010-\u2015/]', ' ', text)
         # Keep only English letters, numbers and spaces
-        cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+        cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned)
         # Remove multiple spaces
         cleaned = ' '.join(cleaned.split())
         return cleaned
@@ -392,9 +455,8 @@ class ProcessingThread(QThread):
                 result = self._analyze_with_openai_api(frames, api_key, is_video=True)
         else:
             result = self._analyze_with_openai_api([image_path], api_key)
-        # If OpenAI API failed (error, quota, etc.), stop processing
         if result is None:
-            error_msg = "ERROR: OpenAI API is not working (check quota and API key). Processing stopped."
+            error_msg = "ERROR: No valid response from AI after 2 attempts (see log above)"
             self.log_message.emit(f"    ❌ {error_msg}")
             raise Exception(error_msg)
         self.log_message.emit(f"    [AI] OpenAI GPT API returned result: title={result.get('title', '')[:30] if result else 'None'}...")
@@ -438,77 +500,98 @@ class ProcessingThread(QThread):
             # Use standard OpenAI endpoint
             self.log_message.emit(f"    [OpenAI] Using standard OpenAI endpoint")
             client = OpenAI(api_key=api_key)
-            
-            self.log_message.emit(f"    [OpenAI] Sending request to API (model: {OPENAI_MODEL})...")
-            
-            # Request to API for image analysis
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                reasoning_effort="none",  # temperature is rejected when reasoning is on
-                messages=self._build_messages(images_data, is_video),
-                max_completion_tokens=1500,  # Enough for complete JSON with 65 keywords
-                temperature=0.3
-            )
+            messages = self._build_messages(images_data, is_video)
+        except Exception as e:
+            self.log_message.emit(f"    ❌ Error preparing request: {str(e)}")
+            return None
+        
+        # Two attempts: retry on invalid JSON, rate limit or temporary API error
+        for attempt in (1, 2):
+            try:
+                self.log_message.emit(f"    [OpenAI] Sending request to API (model: {OPENAI_MODEL}, attempt {attempt}/2)...")
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    reasoning_effort="none",  # temperature is rejected when reasoning is on
+                    messages=messages,
+                    response_format={"type": "json_object"},  # guarantees valid JSON
+                    max_completion_tokens=1500,  # Enough for complete JSON with 65 keywords
+                    temperature=0.3
+                )
+            except Exception as e:
+                error_str = str(e)
+                if is_fatal_api_error(error_str):
+                    # Wrong key or no money: other files will fail the same way
+                    raise FatalAPIError(f"OpenAI API error: {error_str[:300]}")
+                self.log_message.emit(f"    ⚠ [OpenAI] Request error: {error_str[:300]}")
+                if attempt == 1:
+                    if "rate limit" in error_str.lower() or "429" in error_str:
+                        self.log_message.emit(f"    ⚠ Rate limit reached, waiting 60 seconds...")
+                        time.sleep(60)
+                    continue
+                return None
             
             self.log_message.emit(f"    [OpenAI] Response received from API")
-            
-            # Parse response
-            content = response.choices[0].message.content.strip()
+            content = (response.choices[0].message.content or '').strip()
             self.log_message.emit(f"    [OpenAI] AI response received, length: {len(content)} characters")
-            
-            return self._parse_ai_response(content)
-                
-        except Exception as e:
-            error_str = str(e)
-            # Handle rate limit errors
-            if "rate limit" in error_str.lower() or "429" in error_str:
-                self.log_message.emit(f"    ⚠ Rate limit reached, waiting 60 seconds...")
-                time.sleep(60)  # Wait 60 seconds on rate limit
-                # Try to retry request once
-                try:
-                    self.log_message.emit(f"    [OpenAI] Retrying after rate limit...")
-                    response = client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        reasoning_effort="none",
-                        messages=self._build_messages(images_data, is_video),
-                        max_completion_tokens=1500,
-                        temperature=0.3
-                    )
-                    content = response.choices[0].message.content.strip()
-                    self.log_message.emit(f"    [OpenAI] Response received after retry")
-                    return self._parse_ai_response(content)
-                except Exception as e2:
-                    self.log_message.emit(f"    ❌ Error on retry: {str(e2)}")
-            
-            self.log_message.emit(f"    ❌ Error analyzing through OpenAI API: {error_str}")
-            import traceback
-            self.log_message.emit(f"    [OpenAI] Error details: {traceback.format_exc()}")
-            return None
+            result = self._parse_ai_response(content)
+            if result:
+                return result
+            if attempt == 1:
+                self.log_message.emit(f"    ⚠ [OpenAI] Invalid JSON in AI response, retrying...")
+        return None
     
     def _rewrite_description(self, description, forbidden_words):
-        """Text-only request: rewrites description without forbidden words. Returns None on failure"""
+        """Text-only request: rewrites description without forbidden words. Returns None on failure.
+        Up to 3 attempts; each retry is told what was wrong with the previous sentence.
+        If no attempt is clean, returns the one with the fewest problems"""
         if not OPENAI_AVAILABLE or not self.api_key:
             return None
         prompt = (f"Rewrite this stock footage description as ONE natural, grammatical English sentence, "
                   f"40-80 characters, no special characters. Keep the meaning. "
                   f"Do NOT use any of these words or their forms: {', '.join(forbidden_words)}.\n\n"
                   f"Sentence: {description}\n\nReturn ONLY the new sentence.")
+        best, best_score = None, None
+        attempts = 3
         try:
             client = OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                reasoning_effort="none",
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=100,
-                temperature=0.3
-            )
-            rewritten = self.clean_text(response.choices[0].message.content or '')
-            if set(self.normalize_words(rewritten)) & set(forbidden_words):
-                self.log_message.emit(f"    [Metadata] Rewritten description still uses forbidden words, they will be removed")
-            return rewritten or None
+            messages = [{"role": "user", "content": prompt}]
+            for attempt in range(1, attempts + 1):
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    reasoning_effort="none",
+                    messages=messages,
+                    max_completion_tokens=100,
+                    temperature=0.3 if attempt == 1 else 0.7
+                )
+                rewritten = self.clean_text(response.choices[0].message.content or '')
+                if not rewritten:
+                    continue
+                used = sorted(set(self.normalize_words(rewritten)) & set(forbidden_words))
+                too_long = len(rewritten) > 80
+                if not used and not too_long:
+                    return rewritten
+                # Forbidden words are worse than length: length can be fixed by cutting a phrase off
+                score = (len(used), max(0, len(rewritten) - 80))
+                if best_score is None or score < best_score:
+                    best, best_score = rewritten, score
+                problems = []
+                fixes = []
+                if used:
+                    problems.append(f"still uses {used}")
+                    fixes.append(f"it uses the forbidden words {', '.join(used)}; use synonyms or leave that detail out")
+                if too_long:
+                    problems.append(f"is {len(rewritten)} characters")
+                    fixes.append(f"it is {len(rewritten)} characters, it must be at most 80")
+                self.log_message.emit(f"    [Metadata] Rewritten description {' and '.join(problems)}" +
+                                      (", retrying..." if attempt < attempts else ", fixing it in code"))
+                messages = messages + [
+                    {"role": "assistant", "content": rewritten},
+                    {"role": "user", "content": f"Not accepted: {'; '.join(fixes)}. "
+                                                f"Write a different sentence. Return ONLY the new sentence."}]
+            return best
         except Exception as e:
             self.log_message.emit(f"    ⚠ [Metadata] Description rewrite failed: {str(e)}")
-            return None
+            return best
     
     def _parse_ai_response(self, content):
         """Parses AI response and extracts metadata"""
@@ -657,8 +740,48 @@ class ProcessingThread(QThread):
         words = re.findall(r'[a-z0-9]+', text.lower())
         return words
     
+    def build_title(self, title_raw, padding_words, required_words=()):
+        """Builds title from AI title: unique content words in AI order, linking words (and, in, through...)
+        kept between them so the title reads as a phrase. Articles and other stop words are dropped.
+        Padded with padding_words up to 6 words, limited to 10 words, required_words added at the end.
+        Returns (title, content_words)"""
+        tokens = []  # (word, is_connector)
+        seen = set(required_words)
+        for word in self.normalize_words(title_raw):
+            if word in TITLE_CONNECTORS:
+                if tokens and not tokens[-1][1]:  # only right after a content word
+                    tokens.append((word, True))
+            elif len(word) >= 3 and word not in STOP_WORDS and word not in seen:
+                tokens.append((word, False))
+                seen.add(word)
+        
+        def strip_trailing_connectors():
+            while tokens and tokens[-1][1]:
+                tokens.pop()
+        
+        strip_trailing_connectors()
+        # Short title: supplement with AI keywords (not with description words, description keeps them)
+        for word in padding_words:
+            if len(tokens) >= 6:
+                break
+            plural_duplicate = (word + 's' in seen or word + 'es' in seen or
+                                (word.endswith('s') and word[:-1] in seen) or
+                                (word.endswith('es') and word[:-2] in seen))
+            if (word not in seen and not plural_duplicate and len(word) >= 3 and word not in STOP_WORDS and
+                    word not in TITLE_CONNECTORS):
+                tokens.append((word, False))
+                seen.add(word)
+        del tokens[10 - len(required_words):]
+        strip_trailing_connectors()
+        tokens.extend((word, False) for word in required_words)
+        # Title Case; short linking words (and, in, of...) stay lowercase
+        title = ' '.join(w if is_connector and len(w) <= 3 else w.title() for w, is_connector in tokens)
+        return title, [w for w, is_connector in tokens if not is_connector]
+    
     def truncate_description(self, description, max_length=80):
-        """Truncates description to max_length characters, ending at word boundary (without ellipsis)"""
+        """Truncates description to max_length characters without ellipsis.
+        Cuts before the last phrase that does not fit ("...sunny woods and rocky" -> "...sunny woods"),
+        otherwise at a word boundary"""
         if len(description) <= max_length:
             return description
         
@@ -667,24 +790,42 @@ class ProcessingThread(QThread):
         last_space = truncated.rfind(' ')
         
         # If space found, truncate at it, otherwise truncate hard
-        if last_space > 15:  # Minimum 15 characters must remain
-            return truncated[:last_space]
-        else:
-            # If space too close to start, truncate hard
+        if last_space <= 15:  # Minimum 15 characters must remain
             return truncated
+        words = truncated[:last_space].split()
+        # Drop the phrase that was cut: back to the last phrase-starting word, keeping at least 6 words
+        for i in range(len(words) - 1, 5, -1):
+            if words[i].lower() in DESCRIPTION_PHRASE_STARTS:
+                return ' '.join(words[:i])
+        return ' '.join(words)
     
-    def build_description(self, description_raw, title_words_set):
-        """Keeps AI sentence, removes title words and generic words. Returns None if result is unusable"""
-        words = [w for w in description_raw.split()
-                 if w.lower() not in title_words_set and w.lower() not in DESCRIPTION_BANNED_WORDS]
-        description = self.truncate_description(' '.join(words), max_length=80)
-        words = description.split()
-        # Do not end with a dangling article/preposition
+    @staticmethod
+    def _strip_dangling(words):
+        """Removes articles/prepositions left at the end and (except a/an/the) at the start"""
+        words = list(words)
         while words and words[-1].lower() in DESCRIPTION_TRAILING_WORDS:
             words.pop()
-        # Do not start with a dangling article/preposition left after removing title words
         while words and words[0].lower() in DESCRIPTION_TRAILING_WORDS - {"a", "an", "the"}:
             words.pop(0)
+        return words
+    
+    def build_description(self, description_raw, title_words_set):
+        """Keeps AI sentence without title words and generic words. Returns None if result is unusable.
+        A forbidden word is not cut out of the middle of the sentence (that breaks grammar):
+        the sentence is cut before it, if at least 6 words remain"""
+        def forbidden(word):
+            return word.lower() in title_words_set or word.lower() in DESCRIPTION_BANNED_WORDS
+        
+        all_words = description_raw.split()
+        first_bad = next((i for i, w in enumerate(all_words) if forbidden(w)), None)
+        words = all_words
+        if first_bad is not None:
+            words = self._strip_dangling(all_words[:first_bad])
+            if len(words) < 6:
+                # Last resort: remove forbidden words from the sentence
+                words = [w for w in all_words if not forbidden(w)]
+        description = self.truncate_description(' '.join(words), max_length=80)
+        words = self._strip_dangling(description.split())
         if len(words) < 6:
             return None
         description = ' '.join(words)
@@ -723,34 +864,33 @@ class ProcessingThread(QThread):
             # All content words from AI analysis (reserve source for title/keywords)
             all_text = f"{title_raw} {description_raw} {keywords_str_raw}".lower()
             all_words_filtered = list(dict.fromkeys(
-                w for w in self.normalize_words(all_text) if len(w) >= 3 and w not in STOP_WORDS))
+                w for w in self.normalize_words(all_text)
+                if len(w) >= 3 and w not in STOP_WORDS and w not in TITLE_CONNECTORS))
             
-            # STEP 1: TITLE (6-10 unique words, no stop words)
-            title_words = list(dict.fromkeys(
-                w for w in self.normalize_words(title_raw) if len(w) >= 3 and w not in STOP_WORDS))
-            if len(title_words) <= 5:
-                for word in all_words_filtered:
-                    if len(title_words) >= 6:
-                        break
-                    if word not in title_words:
-                        title_words.append(word)
-            if required_words:
-                title_words = [w for w in title_words if w not in required_words]
-                title_words = title_words[:10 - len(required_words)] + required_words
-            title_words = title_words[:10]
-            title = ' '.join(w.title() for w in title_words)
+            # STEP 1: TITLE (6-10 words: unique content words + linking words between them)
+            desc_raw_words = set(self.normalize_words(description_raw))
+            ai_keywords = [w for kw in keywords_str_raw.split(',') for w in self.normalize_words(kw)[:1]]
+            title, title_words = self.build_title(title_raw, [w for w in ai_keywords + all_words_filtered
+                                                              if w not in desc_raw_words], required_words)
             title_words_set = set(title_words)
-            if len(title_words) <= 5:
-                self.log_message.emit(f"    ⚠ WARNING: Title contains only {len(title_words)} words (requires more than 5)")
-            self.log_message.emit(f"    [Metadata] TITLE: '{title}' ({len(title_words)} words)")
+            title_length = len(title.split())
+            if title_length <= 5:
+                self.log_message.emit(f"    ⚠ WARNING: Title contains only {title_length} words (requires more than 5)")
+            self.log_message.emit(f"    [Metadata] TITLE: '{title}' ({title_length} words)")
             
             # STEP 2: DESCRIPTION - AI sentence without title words and generic words
             forbidden = sorted(set(w.lower() for w in description_raw.split())
                                & (title_words_set | DESCRIPTION_BANNED_WORDS))
-            if forbidden:
-                # Ask the model to rewrite the sentence instead of cutting words out of it
-                self.log_message.emit(f"    [Metadata] Description uses title/generic words {forbidden}, asking AI to rewrite...")
-                rewritten = self._rewrite_description(description_raw, sorted(title_words_set | set(forbidden)))
+            too_long = len(description_raw) > 80
+            if forbidden or too_long:
+                # Ask the model to rewrite the sentence instead of cutting words out of it or truncating it
+                reasons = []
+                if forbidden:
+                    reasons.append(f"uses title/generic words {forbidden}")
+                if too_long:
+                    reasons.append(f"is {len(description_raw)} characters (max 80)")
+                self.log_message.emit(f"    [Metadata] Description {' and '.join(reasons)}, asking AI to rewrite...")
+                rewritten = self._rewrite_description(description_raw, sorted(title_words_set | DESCRIPTION_BANNED_WORDS))
                 if rewritten:
                     self.log_message.emit(f"    [Metadata] Rewritten description: '{rewritten}'")
                     description_raw = rewritten
@@ -769,7 +909,7 @@ class ProcessingThread(QThread):
             keywords_seen = set(keywords_list)
             
             def add_keyword(word):
-                if (len(word) < 3 or word in STOP_WORDS or word in keywords_seen or
+                if (len(word) < 3 or word in STOP_WORDS or word in TITLE_CONNECTORS or word in keywords_seen or
                         word in title_words_set or word in desc_words_set):
                     return
                 # Skip singular/plural duplicate of an existing keyword
@@ -805,7 +945,7 @@ class ProcessingThread(QThread):
             if len(description) < 15 or len(description) > 80:
                 raise Exception(f"❌ CRITICAL ERROR: Description contains {len(description)} characters (requires 15-80)")
             
-            self.log_message.emit(f"    ✓ AI analysis completed: title={len(title_words)} words, description={len(description)} characters, keywords={len(keywords_list)} words")
+            self.log_message.emit(f"    ✓ AI analysis completed: title={title_length} words, description={len(description)} characters, keywords={len(keywords_list)} words")
             
             return {
                 'title': title,
@@ -1271,7 +1411,8 @@ class KeyCutterApp(QMainWindow):
     
     def clean_text(self, text):
         """Cleans text from special characters, keeps only English letters, numbers and spaces"""
-        cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+        cleaned = re.sub(r'[-\u2010-\u2015/]', ' ', text)
+        cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', cleaned)
         cleaned = ' '.join(cleaned.split())
         return cleaned
     
@@ -1302,7 +1443,7 @@ class KeyCutterApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "Done",
-                f"Processing completed!\nPhotos with metadata and {VIDEO_CSV_NAME} (for videos) saved to output folder.\nSee the log for videos that do not meet Adobe Stock requirements."
+                f"Processing completed!\nPhotos with metadata and {VIDEO_CSV_NAME} (for videos) saved to output folder.\nSee the log for videos that do not meet Adobe Stock requirements.\n\nLog saved to:\n{self.processing_thread.log_file_path}"
             )
         else:
             self._processing_stopped = False  # Reset flag
